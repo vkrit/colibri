@@ -10,7 +10,7 @@
     } \
 } while (0)
 
-/* alimenta il walker con una stringa; ritorna quanti byte sono stati consumati */
+/* feed the walker with a string; return how many bytes were consumed */
 static int feed(GrState *S, const char *s){
     int n=0;
     while(s[n]){ if(gr_accept(S,(unsigned char)s[n])!=1) break; n++; }
@@ -22,7 +22,7 @@ int main(void){
     GrState S;
     char buf[512];
 
-    /* letterale: tutto il prefisso e' forzato, poi il parse termina */
+    /* literal: the whole prefix is forced, then the parse terminates */
     CHECK(gr_parse(&G,"root ::= \"{\\\"id\\\":\"")==0);
     gr_state_init(&S,&G);
     CHECK(S.alive);
@@ -30,10 +30,10 @@ int main(void){
     CHECK(!memcmp(buf,"{\"id\":",6));
     CHECK(feed(&S,"{\"id\":")==6);
     unsigned char m[32]; int end;
-    CHECK(gr_admissible(&S,m,&end)==0 && end==1);        /* parse completo: solo EOS */
+    CHECK(gr_admissible(&S,m,&end)==0 && end==1);        /* parse complete: only EOS */
     gr_free(&G);
 
-    /* alternate: il forcing si ferma alla diramazione e riparte dopo */
+    /* alternate: forcing stops at the branch and resumes after it */
     CHECK(gr_parse(&G,"root ::= \"a\" (\"b\" | \"c\") \"d\"")==0);
     gr_state_init(&S,&G);
     CHECK(gr_forced(&S,buf,sizeof buf)==1 && buf[0]=='a');
@@ -41,7 +41,7 @@ int main(void){
     CHECK(gr_forced(&S,buf,sizeof buf)==1 && buf[0]=='d');
     gr_free(&G);
 
-    /* enum stile #48: forzata la virgoletta, poi dal primo byte l'intero valore */
+    /* enum, #48 style: the quote is forced, then from the first byte the whole value */
     CHECK(gr_parse(&G,
         "root ::= \"\\\"\" val \"\\\"\"\n"
         "val  ::= \"no_fit\" | \"partial_fit\" | \"good_fit\"")==0);
@@ -51,36 +51,36 @@ int main(void){
     CHECK(gr_forced(&S,buf,sizeof buf)==6 && !memcmp(buf,"o_fit\"",6));
     gr_free(&G);
 
-    /* classi con range, star: niente forcing dove la grammatica dirama */
+    /* classes with ranges, star: no forcing where the grammar branches */
     CHECK(gr_parse(&G,"root ::= \"a\" [0-9]* \"b\"")==0);
     gr_state_init(&S,&G);
     CHECK(feed(&S,"a")==1);
-    CHECK(gr_admissible(&S,m,&end)==11 && end==0);       /* 0-9 oppure b */
+    CHECK(gr_admissible(&S,m,&end)==11 && end==0);       /* 0-9 or b */
     CHECK(gr_forced(&S,buf,sizeof buf)==0);
     CHECK(feed(&S,"42b")==3);
     CHECK(gr_admissible(&S,m,&end)==0 && end==1);
     gr_free(&G);
 
-    /* plus su gruppo: il forcing si ferma dove il parse e' terminabile */
+    /* plus on a group: forcing stops where the parse can terminate */
     CHECK(gr_parse(&G,"root ::= (\"x\" \"\\n\")+")==0);
     gr_state_init(&S,&G);
     CHECK(gr_forced(&S,buf,sizeof buf)==2 && buf[0]=='x' && buf[1]=='\n');
     CHECK(feed(&S,"x\n")==2);
-    CHECK(gr_admissible(&S,m,&end)==1 && end==1);        /* puo' chiudere o aprire una riga */
+    CHECK(gr_admissible(&S,m,&end)==1 && end==1);        /* can close or open a line */
     CHECK(gr_forced(&S,buf,sizeof buf)==0);
     gr_free(&G);
 
-    /* postfisso su letterale multi-byte: ripete l'INTERO letterale */
+    /* postfix on a multi-byte literal: repeats the ENTIRE literal */
     CHECK(gr_parse(&G,"root ::= \"ab\"+ \"c\"")==0);
     gr_state_init(&S,&G);
     CHECK(gr_forced(&S,buf,sizeof buf)==2 && !memcmp(buf,"ab",2));
     CHECK(feed(&S,"ab")==2);
-    CHECK(gr_admissible(&S,m,&end)==2 && end==0);        /* 'a' (ripete) o 'c' (chiude) */
+    CHECK(gr_admissible(&S,m,&end)==2 && end==0);        /* 'a' (repeats) or 'c' (closes) */
     CHECK(feed(&S,"abc")==3);
     CHECK(gr_admissible(&S,m,&end)==0 && end==1);
     gr_free(&G);
 
-    /* classe negata: l'unione con la chiusura copre tutti i byte -> nessun forcing */
+    /* negated class: the union with the closure covers all bytes -> no forcing */
     CHECK(gr_parse(&G,"root ::= \"\\\"\" [^\"]* \"\\\"\"")==0);
     gr_state_init(&S,&G);
     CHECK(feed(&S,"\"")==1);
@@ -89,17 +89,17 @@ int main(void){
     CHECK(gr_admissible(&S,m,&end)==0 && end==1);
     gr_free(&G);
 
-    /* desync: byte non ammesso NON muta lo stato */
+    /* desync: a byte that is not admitted does NOT change the state */
     CHECK(gr_parse(&G,"root ::= \"ab\"")==0);
     gr_state_init(&S,&G);
     CHECK(gr_accept(&S,'x')==0);
     CHECK(gr_accept(&S,'a')==1 && gr_accept(&S,'b')==1);
     gr_free(&G);
 
-    /* escape esadecimale e commenti; regole su piu' righe */
+    /* hexadecimal escape and comments; rules over multiple lines */
     CHECK(gr_parse(&G,
-        "# grammatica di prova\n"
-        "root ::= \"\\x41\"   # una A\n"
+        "# test grammar\n"
+        "root ::= \"\\x41\"   # an A\n"
         "         [\\x30-\\x32]\n")==0);
     gr_state_init(&S,&G);
     CHECK(gr_forced(&S,buf,sizeof buf)==1 && buf[0]=='A');
@@ -107,19 +107,19 @@ int main(void){
     CHECK(gr_admissible(&S,m,&end)==0 && end==1);
     gr_free(&G);
 
-    /* errori di parse: regola indefinita, root mancante, ')' fuori posto */
+    /* parse errors: undefined rule, missing root, ')' out of place */
     CHECK(gr_parse(&G,"root ::= foo")!=0);
     CHECK(gr_parse(&G,"a ::= \"x\"")!=0);
     CHECK(gr_parse(&G,"root ::= \"x\" )")!=0);
 
-    /* ricorsione sinistra: parse ok, walker si spegne senza bloccare (fail-safe) */
+    /* left recursion: parse ok, walker shuts down without blocking (fail-safe) */
     CHECK(gr_parse(&G,"root ::= root \"a\" | \"b\"")==0);
     gr_state_init(&S,&G);
     CHECK(!S.alive);
     CHECK(gr_forced(&S,buf,sizeof buf)==0);
     gr_free(&G);
 
-    /* grammatica NDJSON realistica (il workload di #48): span forzati lunghi */
+    /* realistic NDJSON grammar (the #48 workload): long forced spans */
     CHECK(gr_parse(&G,
         "root ::= riga+\n"
         "riga ::= \"{\\\"id\\\":\\\"\" chiave \"\\\",\\\"fit_category\\\":\\\"\" cat \"\\\"}\" \"\\n\"\n"
@@ -135,8 +135,8 @@ int main(void){
     nf=gr_forced(&S,buf,sizeof buf); buf[nf]=0;
     CHECK(nf==13 && !strcmp(buf,"artial_fit\"}\n"));
     CHECK(feed(&S,"artial_fit\"}\n")==13);
-    /* a fine riga il parse e' terminabile (riga+): niente forcing — il modello puo'
-     * fermarsi qui. Il forcing riparte appena il modello apre la riga successiva. */
+    /* at the end of a line the parse can terminate (riga+): no forcing — the model can
+     * stop here. Forcing resumes as soon as the model opens the next line. */
     CHECK(gr_admissible(&S,m,&end)==1 && end==1);
     CHECK(gr_forced(&S,buf,sizeof buf)==0);
     CHECK(feed(&S,"{")==1);

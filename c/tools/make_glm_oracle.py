@@ -1,20 +1,14 @@
-"""Costruisce un GLM-5.2 (glm_moe_dsa) MINUSCOLO a pesi random come ORACOLO.
-Architettura vera (MLA + DSA indexer + router sigmoid/noaux_tc + shared expert),
-dimensioni minuscole. Salva pesi+config in c/glm_tiny/ e un riferimento greedy in
-c/ref_glm.json. seq corta (<= index_topk) cosi' il DSA seleziona tutte le key e
-l'attenzione coincide con la MLA densa: il motore C puo' validare senza implementare
-l'indexer sparso.
+"""Builds a TINY GLM-5.2 (glm_moe_dsa) with random weights as an ORACLE.
+Real architecture (MLA + DSA indexer + sigmoid/noaux_tc router + shared expert),
+tiny dimensions. Saves weights+config to c/glm_tiny/ and a greedy reference to
+c/ref_glm.json. Short sequence (<= index_topk) so the DSA selects all keys and
+attention matches the dense MLA: the C engine can validate without implementing
+the sparse indexer.
 
---fp8: salva i pesi come FP8 e4m3 + scale a blocchi 128x128 (layout del checkpoint reale
-GLM-5.2-FP8) invece di bf16, cosi' convert_fp8_to_int4.py puo' esercitare il path FP8->int4
-su un modello minuscolo. PRIMA di calcolare ref_glm.json fa il round-trip dei pesi per FP8
-(quant->dequant, copy_ nel modello): cosi' il riferimento riflette ESATTAMENTE il modello
-FP8 che il converter legge, non il modello bf16 a precisione piena. Default: bf16 (oracolo
-originale invariato).
-EN: --fp8 writes FP8 e4m3 + 128x128 block scale_inv (real GLM-5.2-FP8 layout) instead of bf16,
-EN: so convert_fp8_to_int4.py can run its FP8->int4 path on a tiny model. ref_glm.json is
-EN: computed AFTER the FP8 round-trip, so the reference matches exactly what the converter
-EN: ingests. Default: bf16 (original oracle unchanged)."""
+--fp8 writes FP8 e4m3 + 128x128 block scale_inv (real GLM-5.2-FP8 layout) instead of bf16,
+so convert_fp8_to_int4.py can run its FP8->int4 path on a tiny model. ref_glm.json is
+computed AFTER the FP8 round-trip, so the reference matches exactly what the converter
+ingests. Default: bf16 (original oracle unchanged)."""
 import json, sys, argparse
 from pathlib import Path
 import torch
@@ -36,9 +30,9 @@ torch.manual_seed(1234)
 cfg = GlmMoeDsaConfig(
     vocab_size=256,
     hidden_size=128,
-    intermediate_size=64,          # MLP densa (primi 3 layer)
-    moe_intermediate_size=32,      # expert
-    num_hidden_layers=5,           # 3 densi + 2 sparse
+    intermediate_size=64,          # dense MLP (first 3 layers)
+    moe_intermediate_size=32,      # experts
+    num_hidden_layers=5,           # 3 dense + 2 sparse
     first_k_dense_replace=3,
     num_attention_heads=4,
     num_key_value_heads=4,
@@ -48,9 +42,9 @@ cfg = GlmMoeDsaConfig(
     q_lora_rank=64,
     kv_lora_rank=32,
     qk_nope_head_dim=24,
-    qk_rope_head_dim=8,            # pari -> interleave ok; head_dim diventa 8
+    qk_rope_head_dim=8,            # even -> interleave ok; head_dim becomes 8
     v_head_dim=32,
-    index_topk=4096,              # >> seq_len -> DSA seleziona tutto (no-op)
+    index_topk=4096,              # >> seq_len -> DSA selects everything (no-op)
     index_head_dim=16,
     index_n_heads=2,
     n_group=1,
@@ -66,12 +60,12 @@ cfg = GlmMoeDsaConfig(
 cfg._attn_implementation = "eager"
 
 model = GlmMoeDsaForCausalLM(cfg).eval()
-# rende i pesi non banali (default init e' molto piccolo): scala router/bias per topk vario
+# makes the weights non-trivial (the default init is very small): scale router/bias for varied topk
 with torch.no_grad():
     for n, p in model.named_parameters():
         if p.dim() >= 2:
             p.normal_(0, 0.05)
-    # bias di correzione del router: valori distinti cosi' la selezione e' sensata
+    # router correction bias: distinct values so the selection is meaningful
     for i, layer in enumerate(model.model.layers):
         if hasattr(layer.mlp, "gate"):
             layer.mlp.gate.e_score_correction_bias.copy_(
@@ -93,7 +87,7 @@ print("=== state_dict tensors (names used by the C loader) ===")
 for n, p in model.state_dict().items():
     print(f"  {n:60s} {tuple(p.shape)}")
 
-prompt = [3, 14, 159, 26, 53, 58, 200, 11, 77, 240, 5, 99]          # token id arbitrari, seq corta
+prompt = [3, 14, 159, 26, 53, 58, 200, 11, 77, 240, 5, 99]          # arbitrary token ids, short sequence
 ids = torch.tensor([prompt])
 with torch.no_grad():
     out = model.generate(ids, max_new_tokens=20, do_sample=False, use_cache=True)
@@ -101,9 +95,9 @@ full = out[0].tolist()
 print("\nprompt:", prompt)
 print("full  :", full)
 
-# teacher-forcing: un singolo forward su tutta la sequenza -> argmax per posizione.
-# Per il greedy vale tf_pred[i] == full[i+1] per i >= len(prompt)-1; serve a validare
-# il PREFILL del motore C separandolo dal decode.
+# teacher-forcing: a single forward over the whole sequence -> argmax per position.
+# For greedy, tf_pred[i] == full[i+1] holds for i >= len(prompt)-1; this validates
+# the C engine's PREFILL separately from decode.
 with torch.no_grad():
     lg = model(torch.tensor([full]), use_cache=False).logits[0]   # [seq, vocab]
 tf_pred = lg.argmax(-1).tolist()

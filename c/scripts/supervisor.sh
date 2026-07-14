@@ -1,15 +1,15 @@
 #!/usr/bin/env bash
-# Supervisore della conversione GLM-5.2 — a prova di rete WSL che si blocca.
-#  - tiene SEMPRE vivo un (solo) convertitore
-#  - se un download resta FERMO >180s (connessione zombie), lo ammazza e lo rilancia:
-#    hf_hub riprende il .incomplete dal punto esatto, non si perde nulla
-#  - esce da solo quando tutti i 141 shard sono fatti
-# uso da c/:  nohup scripts/supervisor.sh > supervisor.log 2>&1 &
+# GLM-5.2 conversion supervisor — resilient to a WSL network that hangs.
+#  - ALWAYS keeps a (single) converter alive
+#  - if a download stays STUCK >180s (zombie connection), it kills and relaunches it:
+#    hf_hub resumes the .incomplete from the exact point, nothing is lost
+#  - exits on its own when all 141 shards are done
+# usage from c/:  nohup scripts/supervisor.sh > supervisor.log 2>&1 &
 set -u
 DIR="${COLI_MODEL:-/home/vincenzo/glm52_i4}"
 CODE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TOTAL="${TOTAL_SHARDS:-141}"
-STALL_S=180          # secondi senza crescita del download -> riavvio
+STALL_S=180          # seconds without download growth -> restart
 CONVLOG=/tmp/convert_supervised.log
 
 exec 9>"$DIR/.supervisor.lock"
@@ -49,7 +49,7 @@ while :; do
             last_size=$size; stall=0
         fi
     else
-        last_size=-1; stall=0     # niente .incomplete = sta convertendo/salvando: tutto ok
+        last_size=-1; stall=0     # no .incomplete = it is converting/saving: all ok
     fi
     sleep 30
 done

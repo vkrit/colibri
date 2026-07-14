@@ -25,7 +25,7 @@ typedef struct {
     size_t qx_cap, qscale_cap;
     float *host_x,*host_y; size_t host_x_cap,host_y_cap;
     float *aq,*al,*ar,*ac; size_t aq_cap,al_cap,ar_cap,ac_cap;
-    float *pipe_buf[24]; size_t pipe_cap[24];   /* scratch persistenti del resident pipeline */
+    float *pipe_buf[24]; size_t pipe_cap[24];   /* persistent scratch for the resident pipeline */
     cudaStream_t stream;
     void *group_desc; size_t group_desc_cap;
     size_t tensor_count, tensor_bytes;
@@ -637,9 +637,9 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
         grouped_s4_wmma<<<dim3((unsigned)((D+63)/64),(unsigned)count),256,0,ctx->stream>>>(ctx->y,ctx->qx,ctx->qscale,dev,I,D,2);
     }else if(all_s4&&ctx->compute_major>=7&&getenv("COLI_CUDA_TC_W4A16")&&
              atoi(getenv("COLI_CUDA_TC_W4A16"))){
-        /* W4A16 Tensor Core per gruppo: attivazioni fp16 per tile (lossless al
-         * contrario del path W4A4), un lancio per expert dentro lo stream —
-         * l'overhead di lancio e' trascurabile rispetto ai GEMM. */
+        /* W4A16 Tensor Core per group: fp16 activations per tile (lossless as
+         * opposed to the W4A4 path), one launch per expert inside the stream —
+         * the launch overhead is negligible compared to the GEMMs. */
         int tc16_min=getenv("COLI_CUDA_TC_W4A16_MIN")?atoi(getenv("COLI_CUDA_TC_W4A16_MIN")):16;
         int off16=0;
         for(int c=0;c<count;c++){
@@ -655,8 +655,8 @@ extern "C" int coli_cuda_expert_group(ColiCudaTensor *const *gates,
                 w4a16_matmul<<<og16,128,0,ctx->stream>>>(y16,g16,
                     (const uint8_t*)host[c].d,host[c].ds,r,I,D);
             }else{
-                /* piccoli batch: tile TC quasi vuoti + overhead di lancio — il
-                 * kernel naive per-elemento resta piu' veloce (misurato in decode) */
+                /* small batches: nearly empty TC tiles + launch overhead — the
+                 * naive per-element kernel stays faster (measured in decode) */
                 quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(g16,x16,
                     host[c].g,host[c].gs,host[c].gf,r,D,I,row_bytes(host[c].gf,D));
                 quant_matmul<<<dim3((unsigned)I,(unsigned)r),256,0,ctx->stream>>>(u16,x16,
@@ -842,8 +842,8 @@ __global__ static void pipe_rows_add(float *x,const float *partial,const int *ro
     for(int i=threadIdx.x;i<D;i+=blockDim.x) xr[i]+=pr[i];
 }
 
-/* scratch persistente per (device,slot): cresce e resta — niente cudaMalloc/Free
- * per layer (78 x ~10 alloc/richiesta erano puro churn). */
+/* persistent scratch per (device,slot): grows and stays — no cudaMalloc/Free
+ * per layer (78 x ~10 allocs/request were pure churn). */
 extern "C" float *coli_cuda_pipe_scratch(int device,int slot,size_t bytes){
     DeviceContext *ctx=find_ctx(device);
     if(slot<0||slot>=24||!select_ctx(ctx)) return NULL;
@@ -957,7 +957,7 @@ extern "C" int coli_cuda_pipe_gemm(ColiCudaTensor *t,float *y_dev,const float *x
         row_bytes(t->fmt,t->I));
     return cuda_ok(cudaGetLastError(),"pipe gemm");
 }
-/* copia diretta scheda->scheda (P2P se disponibile, altrimenti staging driver) */
+/* direct card->card copy (P2P if available, otherwise driver staging) */
 extern "C" int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev,
                                         const float *src,size_t bytes){
     if(!dst||!src) return 0;
@@ -965,7 +965,7 @@ extern "C" int coli_cuda_pipe_peer_copy(int dst_dev,float *dst,int src_dev,
         return cuda_ok(cudaMemcpy(dst,src,bytes,cudaMemcpyDeviceToDevice),"pipe intra copy"); }
     return cuda_ok(cudaMemcpyPeer(dst,dst_dev,src,src_dev,bytes),"pipe peer copy");
 }
-/* come attention_project_batch_dev ma l'uscita di o_proj RESTA sul device (out_dev). */
+/* like attention_project_batch_dev but the o_proj output STAYS on the device (out_dev). */
 extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiCudaTensor *proj,
         float *out_dev,const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
@@ -984,9 +984,9 @@ extern "C" int coli_cuda_attention_project_batch_dev_out(ColiCudaTensor *w,ColiC
     if(!cuda_ok(cudaGetLastError(),"pipe o_proj launch (dev out)"))return 0;
     return cuda_ok(cudaStreamSynchronize(dc->stream),"pipe attention sync (dev out)");
 }
-/* absorb batch con TUTTO su device (q/latent/rope gia' residenti sulla scheda
- * dello shard, ctx resta sul device): il cuore della attention head-shardata
- * dentro il pipeline. Nessun trasferimento host. */
+/* absorb batch with EVERYTHING on device (q/latent/rope already resident on the shard's
+ * card, ctx stays on the device): the heart of the head-sharded attention
+ * inside the pipeline. No host transfer. */
 extern "C" int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *w,float *ctx_dev,
         const float *q_dev,const float *latent_dev,const float *rope_dev,
         int S,int H,int Q,int R,int V,int K,int T,float scale){
@@ -999,8 +999,8 @@ extern "C" int coli_cuda_attention_absorb_batch_dev(ColiCudaTensor *w,float *ctx
     if(!cuda_ok(cudaGetLastError(),"pipe shard attention launch"))return 0;
     return cuda_ok(cudaStreamSynchronize(dc->stream),"pipe shard attention sync");
 }
-/* absorb per il DECODE con KV gia' residente: carica solo q (poche KB),
- * latent/rope arrivano dall'ombra device. ctx torna a host (S piccolo). */
+/* absorb for the DECODE with KV already resident: loads only q (a few KB),
+ * latent/rope come from the device shadow. ctx returns to host (small S). */
 extern "C" int coli_cuda_attention_absorb_kvdev(ColiCudaTensor *w,float *ctx,const float *q,
         const float *latent_dev,const float *rope_dev,int H,int Q,int R,int V,int K,int T,
         float scale){

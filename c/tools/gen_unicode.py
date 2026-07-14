@@ -1,10 +1,10 @@
-"""Genera tok_unicode.h: tabelle di range per le classi Unicode usate dal
-pre-tokenizer cl100k (regex del tokenizer GLM-5.2):
-  - \\p{L}  lettere   (categoria Unicode che inizia per 'L')
-  - \\p{N}  numeri    (categoria che inizia per 'N')
-  - \\s     whitespace (proprieta' Unicode White_Space)
-Ogni classe diventa un array ordinato di range [lo,hi] inclusivi; il C fa ricerca
-binaria. Eseguire una volta: python3 tools/gen_unicode.py > tok_unicode.h
+"""Generates tok_unicode.h: range tables for the Unicode classes used by the
+cl100k pre-tokenizer (GLM-5.2 tokenizer regex):
+  - \\p{L}  letters    (Unicode category starting with 'L')
+  - \\p{N}  numbers    (category starting with 'N')
+  - \\s     whitespace (Unicode White_Space property)
+Each class becomes a sorted array of inclusive [lo,hi] ranges; the C code does a
+binary search. Run once: python3 tools/gen_unicode.py > tok_unicode.h
 """
 import sys, unicodedata
 
@@ -15,7 +15,7 @@ WHITE_SPACE = {0x09,0x0A,0x0B,0x0C,0x0D,0x20,0x85,0xA0,0x1680,
 def ranges(pred):
     out=[]; lo=None
     for cp in range(0x110000):
-        if 0xD800<=cp<=0xDFFF:        # surrogati: mai
+        if 0xD800<=cp<=0xDFFF:        # surrogates: never
             if lo is not None: out.append((lo,cp-1)); lo=None
             continue
         if pred(cp):

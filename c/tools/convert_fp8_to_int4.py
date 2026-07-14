@@ -1,34 +1,34 @@
 """
-Convertitore GLM-5.2-FP8 -> nostro container int4 (STADIO B).
+GLM-5.2-FP8 -> our int4 container converter (STAGE B).
 
-Strategia DISK-SAFE (richiesta dell'utente): scarica UNO shard (~5 GB), lo converte in
-int4, lo CANCELLA, passa al prossimo. Il disco non si riempie mai: picco = 1 shard + l'output
-int4 che cresce fino a ~372 GB. Controllo di spazio che si ferma se manca margine.
+DISK-SAFE strategy (user request): download ONE shard (~5 GB), convert it to int4,
+DELETE it, move on to the next. The disk never fills up: peak = 1 shard + the int4
+output growing up to ~372 GB. A space check stops if the margin runs low.
 
-Cosa fa per ogni tensore:
-  - pesi FP8 (e4m3) con `*.weight_scale_inv`  -> dequant a blocchi 128x128 -> f32
-  - pesi BF16 (norme/embed/lm_head/...)        -> f32
-  poi:
-  - attn/mlp/shared/expert/embed/lm_head -> QUANTIZZATO int4 (o int8) con la STESSA matematica
-    del motore C (np.rint = lrintf, stesse soglie, stesso packing dei nibble) -> token identici
-  - norme / router (mlp.gate.weight) / bias / e_score_correction_bias -> tenuti F32
-  - indexer DSA / layer MTP (78) / shared_head / eh_proj / *norm dell'indexer -> SALTATI
+What it does for each tensor:
+  - FP8 (e4m3) weights with `*.weight_scale_inv`  -> dequant in 128x128 blocks -> f32
+  - BF16 weights (norms/embed/lm_head/...)         -> f32
+  then:
+  - attn/mlp/shared/expert/embed/lm_head -> QUANTIZED to int4 (or int8) with the SAME math
+    as the C engine (np.rint = lrintf, same thresholds, same nibble packing) -> identical tokens
+  - norms / router (mlp.gate.weight) / bias / e_score_correction_bias -> kept F32
+  - DSA indexer / MTP layer (78) / shared_head / eh_proj / indexer *norm -> SKIPPED
 
-Output: una dir di safetensors leggibile dal motore C (per ogni peso quantizzato: `nome` U8 =
-dati impacchettati, `nome.qs` F32 = scale per riga).
+Output: a directory of safetensors readable by the C engine (for each quantized weight:
+`name` U8 = packed data, `name.qs` F32 = per-row scales).
 
-USO:
-  # test locale (oracolo tiny, niente download): converte una dir gia' presente
+USAGE:
+  # local test (tiny oracle, no download): converts a directory that already exists
   python3 tools/convert_fp8_to_int4.py --indir glm_tiny --outdir glm_tiny_i4 --ebits 4 --io-bits 4
-  # selftest del dequant fp8 (richiede torch)
+  # selftest of the fp8 dequant (requires torch)
   python3 tools/convert_fp8_to_int4.py --selftest
-  # reale: scarica+converte+cancella shard per shard
+  # real: download+convert+delete shard by shard
   python3 tools/convert_fp8_to_int4.py --repo zai-org/GLM-5.2-FP8 --outdir /home/vincenzo/glm52_i4
 """
 import os, sys, glob, json, shutil, argparse
 import numpy as np
 
-# ---------- quantizzazione: identica al C (glm.c) ----------
+# ---------- quantization: identical to the C code (glm.c) ----------
 def quant_int8(w, bits):                       # w: [O,I] f32 -> (qbytes U8 [O*I], scale f32 [O])
     qmax = (1 << (bits - 1)) - 1
     amax = np.abs(w).max(axis=1, keepdims=True)
@@ -41,7 +41,7 @@ def quant_int4(w, bits):                        # -> (qbytes U8 [O*ceil(I/2)], s
     qmax = (1 << (bits - 1)) - 1
     amax = np.abs(w).max(axis=1, keepdims=True)
     s = np.maximum(amax / qmax, 1e-8)
-    q = np.clip(np.rint(w / s), -8, qmax).astype(np.int32)  # nibble [-8,7]
+    q = np.clip(np.rint(w / s), -8, qmax).astype(np.int32)  # nibbles [-8,7]
     rb = (I + 1) // 2
     out = np.zeros((O, rb), np.uint8)
     v0 = (q[:, 0::2] + 8).astype(np.uint8)
@@ -85,28 +85,25 @@ def quant_int4_grouped(w, bits, gs=128):
 
 def quant_int2(w, bits):                        # -> (qbytes U8 [O*ceil(I/4)], scale f32 [O]); 4/byte
     O, I = w.shape
-    qmax = (1 << (bits - 1)) - 1                 # bits=2 -> qmax=1, valori [-2,1]
+    qmax = (1 << (bits - 1)) - 1                 # bits=2 -> qmax=1, values [-2,1]
     amax = np.abs(w).max(axis=1, keepdims=True)
     s = np.maximum(amax / qmax, 1e-8)
     q = np.clip(np.rint(w / s), -2, qmax).astype(np.int32)
     rb = (I + 3) // 4
     out = np.zeros((O, rb), np.uint8)
-    for k in range(4):                           # impacchetta 4 valori per byte (identico a pack_int2 in C)
+    for k in range(4):                           # pack 4 values per byte (identical to pack_int2 in C)
         vk = q[:, k::4]
         out[:, :vk.shape[1]] |= ((vk + 2).astype(np.uint8) << (k * 2))
     return out.reshape(-1), s[:, 0].astype(np.float32)
 
-# ---------- NVFP4 (modelopt) : LUT e2m1 ----------
-# FP4 e2m1 = 1 sign + 2 exp + 1 mantissa. 16 codici, magnitudini {0,.5,1,1.5,2,3,4,6}.
-# Bit 3 = segno. Ordine impacchettato (compressed_tensors/vLLM): nibble BASSO = elemento
-# pari, nibble ALTO = elemento dispari. LUT verificata 1:1 con ml_dtypes.float4_e2m1fn.
-# EN: FP4 e2m1 = 1 sign + 2 exp + 1 mantissa. 16 codes, magnitudes {0,.5,1,1.5,2,3,4,6}.
-# EN: bit 3 = sign. Packed order (compressed_tensors/vLLM): LOW nibble = even element,
-# EN: HIGH nibble = odd element. LUT verified 1:1 against ml_dtypes.float4_e2m1fn.
+# ---------- NVFP4 (modelopt) : e2m1 LUT ----------
+# FP4 e2m1 = 1 sign + 2 exp + 1 mantissa. 16 codes, magnitudes {0,.5,1,1.5,2,3,4,6}.
+# Bit 3 = sign. Packed order (compressed_tensors/vLLM): LOW nibble = even element,
+# HIGH nibble = odd element. LUT verified 1:1 against ml_dtypes.float4_e2m1fn.
 _E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
          -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
 
-# ---------- classificazione dei tensori ----------
+# ---------- tensor classification ----------
 def layer_idx(name):
     p = name.split(".")
     if len(p) > 2 and p[0] == "model" and p[1] == "layers":
@@ -115,28 +112,27 @@ def layer_idx(name):
     return -1
 
 def classify(name, n_layers, keep_mtp=False, keep_idx=False):
-    if name.endswith("_scale_inv"): return "consumed"   # FP8 base: gestito col suo peso
-    # NVFP4 (modelopt): i sidecar delle scale sono consumati insieme al loro U8 .weight.
-    # EN: NVFP4 (modelopt): scale sidecars are consumed together with their U8 .weight.
+    if name.endswith("_scale_inv"): return "consumed"   # FP8 base: handled with its weight
+    # NVFP4 (modelopt): scale sidecars are consumed together with their U8 .weight.
     if name.endswith((".weight_scale", ".weight_scale_2", ".input_scale")): return "consumed"
     li = layer_idx(name)
     if keep_idx:
-        # modalita' --indexer: SOLO i pesi del DSA lightning indexer dei layer principali
+        # --indexer mode: ONLY the DSA lightning-indexer weights of the main layers
         if li < 0 or li >= n_layers or "indexer" not in name: return "skip"
         if name.endswith("norm.weight"): return "f32"
-        return "q"                                       # int8 consigliato (--ebits 8): pesi di scoring
+        return "q"                                       # int8 recommended (--ebits 8): scoring weights
     if keep_mtp:
-        if li != n_layers: return "skip"                 # solo il layer MTP
-        if "indexer" in name: return "skip"              # il DSA indexer resta un no-op
+        if li != n_layers: return "skip"                 # only the MTP layer
+        if "indexer" in name: return "skip"              # the DSA indexer stays a no-op
     else:
-        if li >= n_layers: return "skip"                 # layer MTP (78)
+        if li >= n_layers: return "skip"                 # MTP layer (78)
         if any(k in name for k in ["indexer", "indexers_proj", "eh_proj",
                                     "enorm", "hnorm", "shared_head"]): return "skip"
     if name.endswith("e_score_correction_bias"): return "f32"
-    if name.endswith("mlp.gate.weight"): return "f32"    # router (NON gate_proj)
+    if name.endswith("mlp.gate.weight"): return "f32"    # router (NOT gate_proj)
     if name.endswith("norm.weight") or name == "model.norm.weight": return "f32"
     if name in ("model.embed_tokens.weight", "lm_head.weight"): return "io"
-    if ".mlp.experts." in name and name.endswith(".weight"): return "x"  # expert ROUTED (streaming)
+    if ".mlp.experts." in name and name.endswith(".weight"): return "x"  # ROUTED expert (streaming)
     # Split resident weights by type for mixed-precision control:
     #   "sh" = shared expert (fires on every token, highest sensitivity)
     #   "o"  = o_proj attention (reconstructs output, biggest attn tensor)
@@ -153,57 +149,52 @@ def classify(name, n_layers, keep_mtp=False, keep_idx=False):
     if name.endswith(".weight"): return "q"              # fallback: other resident weights
     return "f32"
 
-# ---------- dequant NVFP4 (modelopt) di UN tensore expert -> f32 [O,I] ----------
+# ---------- NVFP4 (modelopt) dequant of ONE expert tensor -> f32 [O,I] ----------
 def dequant_nvfp4(f, name):
-    """NVFP4 di NVIDIA modelopt (quant_algo=NVFP4, quant_method=modelopt).
-      - `name`               U8   [O, I/2]  : due nibble e2m1 per byte lungo la dim di
-                                              contrazione (input); pari=nibble basso, dispari=alto.
-      - `name.weight_scale`  F8_E4M3 [O, I/16] : scala per-BLOCCO di 16 elementi (group_size=16),
-                                              lungo la dim di input. Decodifica f8e4m3 -> f32.
-      - `name.weight_scale_2` F32 []        : scala GLOBALE per-tensore, ~amax/(6*448) (piccola).
-    Dequant (convenzione modelopt = MOLTIPLICA, NON dividere):
+    """NVIDIA modelopt NVFP4 (quant_algo=NVFP4, quant_method=modelopt).
+      - `name`               U8   [O, I/2]  : two e2m1 nibbles per byte along the
+                                              contraction dim (input); even=low nibble, odd=high.
+      - `name.weight_scale`  F8_E4M3 [O, I/16] : per-BLOCK scale of 16 elements (group_size=16),
+                                              along the input dim. Decodes f8e4m3 -> f32.
+      - `name.weight_scale_2` F32 []        : GLOBAL per-tensor scale, ~amax/(6*448) (small).
+    Dequant (modelopt convention = MULTIPLY, NOT divide):
         W[o,i] = e2m1_lut[nibble] * f8_block_scale[o, i//16] * weight_scale_2
-    FOOTGUN: llm-compressor/compressed-tensors memorizza il RECIPROCO (global grande) e DIVIDE;
-    modelopt memorizza il valore piccolo e MOLTIPLICA. Questo checkpoint e' modelopt -> moltiplica.
-    EN: NVIDIA modelopt NVFP4. LOW nibble=even elem, HIGH=odd. weight_scale = per-16-block FP8
-    EN: (group_size 16) along the input dim; weight_scale_2 = per-tensor global FP32 (~amax/2688,
-    EN: small). Dequant MULTIPLIES both scales. FOOTGUN: llm-compressor stores the reciprocal
-    EN: (large global) and DIVIDES; modelopt stores the small value and MULTIPLIES."""
+    FOOTGUN: llm-compressor/compressed-tensors stores the RECIPROCAL (large global) and DIVIDES;
+    modelopt stores the small value and MULTIPLIES. This checkpoint is modelopt -> multiply."""
     import torch
-    GS = 16                                                       # NVFP4: block scale ogni 16 elementi
+    GS = 16                                                       # NVFP4: block scale every 16 elements
     packed = f.get_tensor(name)                                    # uint8 [O, I/2]
-    bscale = f.get_tensor(name + "_scale").to(torch.float32)        # [O, ceil(I/16)] da f8e4m3
-    gscale = f.get_tensor(name + "_scale_2").to(torch.float32)      # scalare per-tensore
+    bscale = f.get_tensor(name + "_scale").to(torch.float32)        # [O, ceil(I/16)] from f8e4m3
+    gscale = f.get_tensor(name + "_scale_2").to(torch.float32)      # per-tensor scalar
     O, Ih = packed.shape; I = Ih * 2
-    # Convenzione: modelopt memorizza il global PICCOLO e MOLTIPLICA. Se e' >=1 e'
-    # quasi certamente il reciproco di compressed-tensors (che DIVIDE) -> ci fermiamo
-    # invece di corrompere silenziosamente ogni tensore. EN: guard modelopt-vs-CT.
+    # Convention: modelopt stores the SMALL global and MULTIPLIES. If it is >=1 it is
+    # almost certainly the compressed-tensors reciprocal (which DIVIDES) -> we stop
+    # instead of silently corrupting every tensor.
     assert float(gscale) < 1.0, (
-        f"{name}: weight_scale_2={float(gscale):.4g} >= 1 sembra il reciproco "
-        "(compressed-tensors, che DIVIDE); questo path assume modelopt (MOLTIPLICA)")
-    # Il layout deve essere lo scale per-blocco piatto di modelopt: una colonna ogni
-    # 16 elementi di input (niente swizzle cutlass/TensorRT). Verifichiamo, non deduciamo:
-    # dedurre gs = I // ncol misallinea in silenzio su layout paddati/swizzati.
+        f"{name}: weight_scale_2={float(gscale):.4g} >= 1 looks like the reciprocal "
+        "(compressed-tensors, which DIVIDES); this path assumes modelopt (MULTIPLIES)")
+    # The layout must be modelopt's flat per-block scale: one column every 16 input
+    # elements (no cutlass/TensorRT swizzle). We verify, we don't infer:
+    # inferring gs = I // ncol silently misaligns on padded/swizzled layouts.
     nb = (I + GS - 1) // GS
     assert bscale.shape[1] == nb, (
-        f"{name}: weight_scale ha {bscale.shape[1]} colonne, attese {nb} = ceil({I}/{GS}); "
-        "layout scale inatteso (swizzled/paddato?), rifiuto per non corrompere")
+        f"{name}: weight_scale has {bscale.shape[1]} columns, expected {nb} = ceil({I}/{GS}); "
+        "unexpected scale layout (swizzled/padded?), refusing so as not to corrupt")
     lut = torch.tensor(_E2M1, dtype=torch.float32)
     nib = torch.empty((O, I), dtype=torch.long)
-    nib[:, 0::2] = (packed & 0x0F).to(torch.long)                  # elemento pari = nibble basso
-    nib[:, 1::2] = ((packed >> 4) & 0x0F).to(torch.long)           # elemento dispari = nibble alto
-    w4 = lut[nib]                                                  # [O, I] valori e2m1
-    sc = bscale.repeat_interleave(GS, dim=1)[:, :I]               # blocco parziale di coda: slice a I
+    nib[:, 0::2] = (packed & 0x0F).to(torch.long)                  # even element = low nibble
+    nib[:, 1::2] = ((packed >> 4) & 0x0F).to(torch.long)           # odd element = high nibble
+    w4 = lut[nib]                                                  # [O, I] e2m1 values
+    sc = bscale.repeat_interleave(GS, dim=1)[:, :I]               # partial tail block: slice to I
     return (w4 * sc * gscale).numpy()
 
-# ---------- dequant di un tensore (nvfp4 / fp8+scale a blocchi / bf16 / f32) ----------
+# ---------- dequant of one tensor (nvfp4 / fp8+block-scale / bf16 / f32) ----------
 def dequant(f, name, keys):
     import torch
     sl = f.get_slice(name); dt = sl.get_dtype()
-    # NVFP4 (modelopt): pesi expert U8 con sidecar `.weight_scale`. In questo checkpoint gli
-    # UNICI tensori U8 sono gli expert NVFP4, ma richiediamo comunque il sidecar (keys e'
-    # obbligatorio: senza, un qualunque U8 verrebbe decodificato come NVFP4).
-    # EN: NVFP4 expert weights are U8 with a `.weight_scale` sidecar; require the sidecar.
+    # NVFP4 (modelopt): U8 expert weights with a `.weight_scale` sidecar. In this checkpoint
+    # the ONLY U8 tensors are the NVFP4 experts, but we still require the sidecar (keys is
+    # mandatory: without it, any U8 would be decoded as NVFP4).
     if dt in ("U8", "uint8") and (name + "_scale") in keys:
         return dequant_nvfp4(f, name)
     if dt in ("F8_E4M3", "float8_e4m3fn"):
@@ -235,7 +226,7 @@ def convert_shard(path, out_dict, n_layers, ebits, io_bits, xbits,
                 # Any unknown kind that fell through classify as "q"
                 if bits_map and kind not in bits_map and kind not in ("io", "x", "sh", "o", "kvb", "attn", "dmlp"):
                     bits = ebits
-                if w.ndim != 2:        # es. bias 1D non previsto come 'q' -> tienilo f32
+                if w.ndim != 2:        # e.g. a 1D bias not expected as 'q' -> keep it f32
                     out_dict[name] = w.astype(np.float32); continue
                 if group_size > 0 and bits <= 4:
                     q, s = quant_int4_grouped(w, bits, group_size)
@@ -252,9 +243,9 @@ def main():
     ap.add_argument("--repo", default=None)
     ap.add_argument("--indir", default=None)
     ap.add_argument("--outdir", required=False)
-    ap.add_argument("--ebits", type=int, default=None)   # bit residenti (default 4; 8 per --mtp/--indexer)
-    ap.add_argument("--io-bits", type=int, default=8)    # bit di embed/lm_head
-    ap.add_argument("--xbits", type=int, default=None)   # bit degli expert ROUTED (streaming); default=ebits
+    ap.add_argument("--ebits", type=int, default=None)   # resident bits (default 4; 8 for --mtp/--indexer)
+    ap.add_argument("--io-bits", type=int, default=8)    # bits for embed/lm_head
+    ap.add_argument("--xbits", type=int, default=None)   # bits for ROUTED experts (streaming); default=ebits
     # Mixed-precision: per-tensor-type bit overrides. Default = ebits (all same).
     # Set these higher to protect sensitive tensors from quantization error.
     ap.add_argument("--shared-bits", type=int, default=None,
@@ -273,7 +264,7 @@ def main():
     ap.add_argument("--min-free-gb", type=float, default=20.0)
     ap.add_argument("--selftest", action="store_true")
     ap.add_argument("--selftest-nvfp4", action="store_true",
-        help="unit-test del dequant NVFP4 (LUT e2m1 + round-trip), nessun download / no network")
+        help="unit-test the NVFP4 dequant (e2m1 LUT + round-trip), no download / no network")
     ap.add_argument("--mtp", action="store_true",
         help="download and convert ONLY the MTP head (model.layers.<n_layers>.*) -> out-mtp-*.safetensors")
     ap.add_argument("--indexer", action="store_true",
@@ -283,8 +274,8 @@ def main():
              "Recommended: --ebits 8.")
     a = ap.parse_args()
     if a.ebits is None:
-        # testa MTP a int4 = acceptance ~0-4% (misurato, issue #8): il draft sbaglia sempre
-        # e la speculazione non parte mai. A int8: 39-59%, 2.2-2.8 token/forward.
+        # MTP head at int4 = acceptance ~0-4% (measured, issue #8): the draft is always wrong
+        # and speculation never kicks in. At int8: 39-59%, 2.2-2.8 tokens/forward.
         a.ebits = 8 if (a.mtp or a.indexer) else 4
     if a.xbits is None: a.xbits = a.ebits
 
@@ -301,61 +292,60 @@ def main():
 
     if a.selftest_nvfp4:
         import torch
-        # 1) LUT e2m1: i 16 codici devono decodificare esattamente ai valori attesi.
+        # 1) e2m1 LUT: the 16 codes must decode exactly to the expected values.
         lut = torch.tensor(_E2M1, dtype=torch.float32)
         expect = [0.0,0.5,1.0,1.5,2.0,3.0,4.0,6.0,-0.0,-0.5,-1.0,-1.5,-2.0,-3.0,-4.0,-6.0]
-        assert lut.tolist() == expect, "LUT e2m1 errata"
-        print("[nvfp4] LUT e2m1: 16/16 codici OK")
-        # 2) round-trip: costruisco un tensore ai SOLI valori rappresentabili (scala nota per
-        #    blocco+globale), impacchetto come modelopt, poi dequant deve tornare ESATTO.
+        assert lut.tolist() == expect, "wrong e2m1 LUT"
+        print("[nvfp4] e2m1 LUT: 16/16 codes OK")
+        # 2) round-trip: build a tensor using ONLY representable values (known per-block +
+        #    global scale), pack it like modelopt, then dequant must come back EXACT.
         import numpy as np, io
         from safetensors.torch import save as st_save
         from safetensors import safe_open
         rng = np.random.default_rng(0); O, I, GS = 8, 64, 16
-        codes = rng.integers(0, 16, size=(O, I)).astype(np.uint8)   # nibble e2m1 casuali
+        codes = rng.integers(0, 16, size=(O, I)).astype(np.uint8)   # random e2m1 nibbles
         w4 = np.array(_E2M1, np.float32)[codes]                      # [O,I]
-        # scale per-blocco (rappresentabili in f8e4m3) + globale piccola (stile modelopt)
+        # per-block scales (representable in f8e4m3) + small global (modelopt style)
         blk = rng.choice([0.5,1.0,2.0,4.0,8.0], size=(O, I//GS)).astype(np.float32)
         gscale = np.float32(3.9e-5)
-        W = w4 * np.repeat(blk, GS, axis=1) * gscale                 # riferimento esatto
-        # impacchetto: pari->nibble basso, dispari->alto
+        W = w4 * np.repeat(blk, GS, axis=1) * gscale                 # exact reference
+        # pack: even->low nibble, odd->high
         packed = (codes[:, 0::2] | (codes[:, 1::2] << 4)).astype(np.uint8)
-        import ml_dtypes  # solo per il test: encode f8e4m3 delle scale di blocco
+        import ml_dtypes  # test only: f8e4m3 encode of the block scales
         tens = {name: torch.from_numpy(arr) for name, arr in {
             "w.weight": packed,
             "w.weight_scale": blk.astype(ml_dtypes.float8_e4m3fn).view(np.uint8),  # placeholder
         }.items()}
-        # torch non ha un costruttore da bytes f8: passo via file safetensors scritto a mano.
-        # piu' semplice: uso direttamente dequant_nvfp4 su un finto 'f' in-memory.
+        # torch has no constructor from f8 bytes: go through a hand-written safetensors file.
+        # simpler: call dequant_nvfp4 directly on a fake in-memory 'f'.
         class _F:
             def __init__(s, d): s.d = d
             def get_tensor(s, n): return s.d[n]
             def get_slice(s, n): return None
-        blk_f8 = blk.astype(ml_dtypes.float8_e4m3fn)                 # quantizza le scale a f8
+        blk_f8 = blk.astype(ml_dtypes.float8_e4m3fn)                 # quantize the scales to f8
         f = _F({"w.weight": torch.from_numpy(packed),
                 "w.weight_scale": torch.from_numpy(blk_f8.view(np.uint8)).view(torch.float8_e4m3fn),
                 "w.weight_scale_2": torch.tensor(gscale)})
         got = dequant_nvfp4(f, "w.weight")
-        # riferimento con scale gia' quantizzate a f8 (per confronto esatto)
+        # reference with scales already quantized to f8 (for an exact comparison)
         Wq = w4 * np.repeat(blk_f8.astype(np.float32), GS, axis=1) * gscale
         maxerr = float(np.abs(got - Wq).max())
         print(f"[nvfp4] round-trip encode->dequant: max abs err = {maxerr:.3e} "
               f"({'OK' if maxerr < 1e-9 else 'FAIL'})")
         assert maxerr < 1e-9
-        # 3) requant colibri int4 su valori dequantati -> errore piccolo atteso
+        # 3) colibri int4 requant on the dequantized values -> small error expected
         q, s = quant_int4(got.astype(np.float32), 4)
         rb = (I + 1)//2; qb = q.reshape(O, rb)
         lo = (qb & 0x0F).astype(np.int32) - 8; hi = ((qb >> 4) & 0x0F).astype(np.int32) - 8
         deq = np.empty((O, I), np.float32); deq[:, 0::2] = lo; deq[:, 1::2] = hi[:, :I-I//2]
         deq = deq * s[:, None]
         rel = np.abs(deq - got).mean() / (np.abs(got).mean() + 1e-12)
-        # Informativo, NON un test di uguaglianza: requantizzare int4 per-riga dati che
-        # spaziano 16x per il block-scale costa ~0.17 di errore relativo di suo. La soglia
-        # larga becca solo una corruzione grossolana, non e' un bound di precisione.
-        # EN: informational — per-row int4 requant of 16x-block-range data inherently ~0.17.
-        print(f"[nvfp4] dequant->colibri int4->dequant: errore rel medio = {rel:.4f} "
-              f"(atteso ~0.17; {'OK' if rel < 0.30 else 'ANOMALO'})")
-        assert rel < 0.30, f"requant rel err {rel:.3f} troppo alto: dequant probabilmente corrotto"
+        # Informational, NOT an equality test: per-row int4 requant of data spanning 16x
+        # because of the block-scale costs ~0.17 relative error on its own. The loose
+        # threshold only catches gross corruption, it is not a precision bound.
+        print(f"[nvfp4] dequant->colibri int4->dequant: mean rel error = {rel:.4f} "
+              f"(expected ~0.17; {'OK' if rel < 0.30 else 'ANOMALOUS'})")
+        assert rel < 0.30, f"requant rel err {rel:.3f} too high: dequant probably corrupted"
         print("[nvfp4] SELFTEST OK")
         return
 
@@ -376,45 +366,36 @@ def main():
         return
 
     os.makedirs(a.outdir, exist_ok=True)
-    if a.indir:    # conversione locale (test)
+    if a.indir:    # local conversion (test)
         shards = sorted(glob.glob(os.path.join(a.indir, "*.safetensors")))
         from safetensors.numpy import save_file
         for i, sp in enumerate(shards):
             out = {}; convert_shard(sp, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
             save_file(out, os.path.join(a.outdir, f"out-{i:05d}.safetensors"))
-        # copia config + tokenizer
+        # copy config + tokenizer
         for fn in ["config.json"]:
             src = os.path.join(a.indir, fn)
             if os.path.exists(src): shutil.copy(src, a.outdir)
         print(f"converted {len(shards)} shards -> {a.outdir}")
         return
 
-    # reale: scarica shard per shard, converte, cancella
-    # EN: real: download shard by shard, convert, delete
+    # real: download shard by shard, convert, delete
     #
-    # ROBUSTEZZA RETE: timeout brevi sulle read cosi' un download appeso FALLISCE invece
-    # di restare fermo per sempre. 8s, non 30: "timeout" = ZERO byte ricevuti in quella
-    # finestra; su un transfer vivo i chunk arrivano di continuo, quindi 8s e' sicuro e
-    # uno stallo costa 8s invece di 30.
-    # EN: NETWORK ROBUSTNESS: short read timeouts so a hung download FAILS instead of
-    # EN: sitting there forever. 8s, not 30: a "timeout" means ZERO bytes received in that
-    # EN: window; a live transfer delivers chunks constantly, so 8s is safe and a stall
-    # EN: costs 8s instead of 30.
+    # NETWORK ROBUSTNESS: short read timeouts so a hung download FAILS instead of
+    # sitting there forever. 8s, not 30: a "timeout" means ZERO bytes received in that
+    # window; on a live transfer chunks arrive constantly, so 8s is safe and a stall
+    # costs 8s instead of 30.
     os.environ.setdefault("HF_HUB_DOWNLOAD_TIMEOUT", "8")
     os.environ.setdefault("HF_HUB_ETAG_TIMEOUT", "15")
-    # log con timestamp: i messaggi "Trying to resume" di hf_hub diventano databili.
-    # EN: timestamped logs: hf_hub's "Trying to resume" messages become datable.
+    # timestamped logs: hf_hub's "Trying to resume" messages become datable.
     import logging
     logging.basicConfig(format="%(asctime)s %(name)s: %(message)s", datefmt="%H:%M:%S")
-    # hf_xet si blocca quando la rete si riavvia (connessioni zombie senza timeout):
-    # forza la via HTTP classica, che curl ha dimostrato funzionare. (misurato 2026-07-02)
-    # EN: hf_xet hangs when the network restarts (zombie connections with no timeout):
-    # EN: force the classic HTTP path, which curl proved works (measured 2026-07-02).
-    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")   # =0 per riabilitare xet / to re-enable xet
+    # hf_xet hangs when the network restarts (zombie connections with no timeout):
+    # force the classic HTTP path, which curl proved works (measured 2026-07-02).
+    os.environ.setdefault("HF_HUB_DISABLE_XET", "1")   # =0 to re-enable xet
     from huggingface_hub import HfApi, hf_hub_download
 
-    # lock anti-doppione: DUE convertitori sulla stessa outdir si corrompono a vicenda.
-    # EN: anti-duplicate lock: TWO converters on the same outdir corrupt each other.
+    # anti-duplicate lock: TWO converters on the same outdir corrupt each other.
     # fcntl is Unix-only; on Windows use msvcrt or skip locking.
     lock = open(os.path.join(a.outdir, ".convert.lock"), "w")
     try:
@@ -431,25 +412,17 @@ def main():
         except ImportError:
             pass  # no locking available — single-user converter, acceptable
 
-    # dimensioni note dei file, riempite dopo repo_info: il downloader multi-stream le usa
-    # per calcolare i confini dei segmenti e per sapere quando un file e' completo.
-    # EN: known file sizes, filled after repo_info: the multi-stream downloader uses them
-    # EN: to compute segment boundaries and to know when a file is complete.
+    # known file sizes, filled in after repo_info: the multi-stream downloader uses them
+    # to compute segment boundaries and to know when a file is complete.
     SIZES = {}
 
     def download_retry(repo, fn, dest, tries=999):
-        """Downloader multi-stream con resume via Range. Apre N segmenti concorrenti
-        (default 2, COLI_DL_STREAMS per cambiarli) e salva lo stato per-segmento in un
-        sidecar .seg -> NESSUN byte perso comunque muoia la connessione. Un singolo stream
-        HF e' limitato a ~2 MB/s (misurato); 2 stream ~ raddoppiano il throughput senza
-        saturare una linea domestica. File piccoli, COLI_DL_STREAMS=1 o un vecchio .part
-        legacy -> percorso a stream singolo (_download_single).
-        EN: multi-stream Range-resume downloader. Opens N concurrent segments (default 2,
-        EN: COLI_DL_STREAMS to change) and saves per-segment state in a .seg sidecar -> NO
-        EN: byte is lost however the connection dies. A single HF stream is paced at
-        EN: ~2 MB/s (measured); 2 streams roughly double throughput without saturating a
-        EN: home line. Small files, COLI_DL_STREAMS=1 or a legacy .part -> single-stream
-        EN: path (_download_single)."""
+        """Multi-stream downloader with Range resume. Opens N concurrent segments
+        (default 2, COLI_DL_STREAMS to change) and saves per-segment state in a .seg
+        sidecar -> NO byte is lost however the connection dies. A single HF stream is
+        paced at ~2 MB/s (measured); 2 streams roughly double throughput without
+        saturating a home line. Small files, COLI_DL_STREAMS=1 or an old legacy .part
+        -> single-stream path (_download_single)."""
         import time as _t, threading, urllib.request, urllib.error
         url = f"https://huggingface.co/{repo}/resolve/main/{fn}"
         out = os.path.join(dest, fn); part = out + ".part"; side = part + ".seg"
@@ -458,23 +431,21 @@ def main():
         if os.path.exists(out) and (expected is None or os.path.getsize(out) == expected):
             return out
         NS = max(1, min(8, int(os.environ.get("COLI_DL_STREAMS", "2"))))
-        # un .part senza sidecar l'ha scritto una versione precedente a stream singolo.
-        # EN: a .part without a sidecar was written by an older single-stream version.
+        # a .part without a sidecar was written by an older single-stream version.
         legacy = os.path.exists(part) and not os.path.exists(side)
         if expected is None or expected < (256 << 20) or NS == 1 or legacy:
             return _download_single(url, fn, out, part, expected)
         # ---- multi-stream ----
         segs = [(expected * t // NS, expected * (t + 1) // NS) for t in range(NS)]
         done = [0] * NS
-        # riprendi lo stato dei segmenti se il sidecar combacia (stesso N, stessa size).
-        # EN: resume per-segment progress if the sidecar matches (same N, same size).
+        # resume per-segment progress if the sidecar matches (same N, same size).
         if os.path.exists(side):
             try:
                 st = json.loads(open(side).read())
                 if st.get("n") == NS and st.get("size") == expected: done = st["done"]
             except Exception: pass
         if not os.path.exists(part):
-            with open(part, "wb") as f: f.truncate(expected)   # file sparse / sparse file
+            with open(part, "wb") as f: f.truncate(expected)   # sparse file
         fd = os.open(part, os.O_WRONLY)
         t0 = _t.time(); nres = [0]; log_lock = threading.Lock(); stopfail = []
         def worker(t):
@@ -485,12 +456,12 @@ def main():
                                                            "Range": f"bytes={pos}-{s1-1}"})
                 try:
                     with urllib.request.urlopen(req, timeout=8) as r:
-                        if r.status != 206:               # Range ignorato: multi-stream impossibile
-                            stopfail.append(t); return    # EN: Range ignored: multi-stream impossible
+                        if r.status != 206:               # Range ignored: multi-stream impossible
+                            stopfail.append(t); return
                         while done[t] < s1 - s0:
                             chunk = r.read(1 << 20)
                             if not chunk: break
-                            rem = (s1 - s0) - done[t]     # mai oltre il segmento / never past the segment
+                            rem = (s1 - s0) - done[t]     # never past the segment
                             if len(chunk) > rem: chunk = chunk[:rem]
                             os.pwrite(fd, chunk, s0 + done[t])
                             done[t] += len(chunk)
@@ -509,7 +480,7 @@ def main():
         while any(x.is_alive() for x in th):
             _t.sleep(5)
             have = sum(done)
-            tmpside = side + ".tmp"                       # checkpoint atomico / atomic checkpoint
+            tmpside = side + ".tmp"                       # atomic checkpoint
             open(tmpside, "w").write(json.dumps({"n": NS, "size": expected, "done": list(done)}))
             os.replace(tmpside, side)
             now = _t.time()
@@ -518,8 +489,8 @@ def main():
                       f"({(have-mark)/max(now-tmark,1e-9)/1e6:5.1f} MB/s, {NS} stream)", flush=True)
                 mark = have; tmark = now
         os.close(fd)
-        if stopfail:                                      # il server non onora il Range: fallback
-            for f2 in (part, side):                       # EN: server won't honor Range: fall back
+        if stopfail:                                      # server won't honor Range: fall back
+            for f2 in (part, side):
                 if os.path.exists(f2): os.remove(f2)
             return _download_single(url, fn, out, part, expected)
         assert sum(done) == expected
@@ -531,12 +502,9 @@ def main():
         return out
 
     def _download_single(url, fn, out, part, expected):
-        """Percorso a stream singolo con resume via Range (file piccoli / .part legacy /
-        COLI_DL_STREAMS=1). Un EOF corto ma pulito conta come ripresa; se non arriva
-        NESSUN byte nuovo, backoff invece di girare a vuoto.
-        EN: single-stream path with Range resume (small files / legacy .part /
-        EN: COLI_DL_STREAMS=1). A clean short EOF counts as a resume; if NO new byte
-        EN: arrives, back off instead of spinning."""
+        """Single-stream path with Range resume (small files / legacy .part /
+        COLI_DL_STREAMS=1). A clean short EOF counts as a resume; if NO new byte
+        arrives, back off instead of spinning."""
         import time as _t, urllib.request, urllib.error
         t0 = _t.time(); nres = 0; mark = 0; tmark = t0
         while True:
@@ -547,12 +515,12 @@ def main():
             if have: req.add_header("Range", f"bytes={have}-")
             try:
                 with urllib.request.urlopen(req, timeout=8) as r:
-                    if have and r.status == 200:          # server ha ignorato il Range: riparti pulito
-                        have = 0                          # EN: server ignored Range: restart clean
+                    if have and r.status == 200:          # server ignored Range: restart clean
+                        have = 0
                     if expected is None:
                         cl = r.headers.get("Content-Length")
                         if cl: expected = have + int(cl)
-                    if have == 0 or nres:                 # segnale di vita subito / immediate sign of life
+                    if have == 0 or nres:                 # immediate sign of life
                         print(f"    [dl {_t.strftime('%H:%M:%S')}] connected"
                               f"{f' @ {have/1e9:.2f} GB' if have else ''}"
                               f"{f' of {expected/1e9:.2f} GB' if expected else ''}", flush=True)
@@ -567,13 +535,13 @@ def main():
                                 print(f"    [dl {_t.strftime('%H:%M:%S')}] {have/1e9:5.2f} GB "
                                       f"({(have-mark)/max(now-tmark,1e-9)/1e6:5.1f} MB/s)", flush=True)
                                 mark = have; tmark = now
-                if expected is None: break                # lunghezza ignota: passata singola / unknown length
-                if have < expected:                       # EOF corto ma pulito: conta come ripresa
-                    nres += 1                             # EN: clean short EOF: counts as a resume
-                    if have == have0: _t.sleep(min(15, 1 + nres))   # zero progresso -> backoff / zero progress -> back off
+                if expected is None: break                # unknown length: single pass
+                if have < expected:                       # clean short EOF: counts as a resume
+                    nres += 1
+                    if have == have0: _t.sleep(min(15, 1 + nres))   # zero progress -> back off
             except KeyboardInterrupt: raise
             except urllib.error.HTTPError as ex:
-                if ex.code == 416: break                  # gia' completo / already complete
+                if ex.code == 416: break                  # already complete
                 nres += 1
                 print(f"    [dl] HTTP {ex.code} at {have/1e9:.2f} GB: resuming (#{nres})", flush=True)
                 _t.sleep(min(15, 1 + nres))
@@ -593,8 +561,7 @@ def main():
     for att in range(10):
         try:
             info = HfApi().repo_info(a.repo, files_metadata=True)
-            # dimensioni note dallo store: abilitano il download multi-stream a segmenti.
-            # EN: sizes known from the store: enable segmented multi-stream download.
+            # sizes known from the store: enable segmented multi-stream download.
             SIZES.update({s.rfilename: s.size for s in info.siblings if s.size})
             break
         except KeyboardInterrupt: raise
@@ -640,7 +607,7 @@ def main():
         print(f"[IDX] indexer weights across {len(idx_shards)} shards (~{tot_gb:.0f} GB total download, resumable)")
         for i, sh in enumerate(idx_shards):
             outp = os.path.join(a.outdir, f"out-idx-{i:05d}.safetensors")
-            if os.path.exists(outp): continue             # gia' fatto -> ripartibile
+            if os.path.exists(outp): continue             # already done -> resumable
             print(f"[IDX {i+1}/{len(idx_shards)}] downloading {sh}...", flush=True)
             p = download_retry(a.repo, sh, tmp)
             out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, keep_idx=True, group_size=a.group_size, bits_map=bits_map)
@@ -654,12 +621,12 @@ def main():
         if free_gb(a.outdir) < a.min_free_gb:
             print(f"STOP: free space is below {a.min_free_gb} GB. Free space and rerun to resume."); break
         outp = os.path.join(a.outdir, f"out-{i:05d}.safetensors")
-        if os.path.exists(outp): continue                 # gia' fatto -> ripartibile
+        if os.path.exists(outp): continue                 # already done -> resumable
         print(f"[{i+1}/{len(shards)}] downloading {sh} ({free_gb(a.outdir):.0f} GB free)...", flush=True)
         p = download_retry(a.repo, sh, tmp)
         out = {}; convert_shard(p, out, a.n_layers, a.ebits, a.io_bits, a.xbits, group_size=a.group_size, bits_map=bits_map)
         save_file(out, outp)
-        os.remove(p)                                       # <-- cancella subito lo shard fp8
+        os.remove(p)                                       # <-- delete the fp8 shard right away
         for blob in glob.glob(os.path.join(tmp, "**", "*"), recursive=True):
             if os.path.isfile(blob): os.remove(blob)
         print(f"    -> {os.path.basename(outp)} ({os.path.getsize(outp)/1e9:.2f} GB)", flush=True)

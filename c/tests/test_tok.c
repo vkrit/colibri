@@ -1,6 +1,6 @@
-/* Validazione del tokenizer C contro l'oracolo HF.
- * build da c/: gcc -O2 tests/test_tok.c -o tok_test
- * uso:  ./tok_test <tokenizer.json>   (legge righe "TEXT\tID,ID,.." da stdin) */
+/* Validation of the C tokenizer against the HF oracle.
+ * build from c/: gcc -O2 tests/test_tok.c -o tok_test
+ * usage:  ./tok_test <tokenizer.json>   (reads "TEXT\tID,ID,.." lines from stdin) */
 #define _GNU_SOURCE
 #include "../tok.h"
 
@@ -16,7 +16,7 @@ int main(int argc, char **argv){
         if(nr==0) continue;
         char *tab=strchr(line,'\t'); if(!tab) continue;
         *tab=0; const char *text=line; const char *idstr=tab+1;
-        /* il testo puo' contenere \n e \t codificati come \\n \\t */
+        /* the text can contain \n and \t encoded as \\n \\t */
         char tbuf[4096]; int tn=0;
         for(const char *q=text; *q && tn<4095; q++){
             if(q[0]=='\\' && q[1]=='n'){ tbuf[tn++]='\n'; q++; }

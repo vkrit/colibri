@@ -37,7 +37,7 @@ scenario(){ # name prompt ngen
     local log; log=$(mktemp)
     NGEN=$ngen PROMPT="$prompt" "$GLM" 64 4 4 >"$log" 2>&1
     local line; line=$(grep -aE "prefill .* decode .*tok/s" "$log" | tail -1)
-    local head; head=$(grep -av "^\[" "$log" | grep -avE "PROFILE|PROFILO|ATTENTION|expert|CUDA|prefill|specul|^---|TOPP|stop|Motore|caricato|prompt:|token" \
+    local head; head=$(grep -av "^\[" "$log" | grep -avE "PROFILE|ATTENTION|expert|CUDA|prefill|specul|^---|TOPP|stop|loaded|prompt:|token" \
                        | tail -1 | tr -d '\n' | cut -c1-48)
     printf "%-10s r%d  %s\n" "$name" "$r" "$line"
     printf "%-10s r%d  text: %s\n" "$name" "$r" "$head"

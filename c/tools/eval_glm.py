@@ -1,41 +1,41 @@
 """
-Harness di validazione qualita' per il motore C GLM-5.2 (int4 streaming).
-Fa passare IL NOSTRO modello sugli stessi benchmark LLM standard (stile EleutherAI
-lm-evaluation-harness) usando la **log-likelihood** delle risposte multiple: un solo
-forward per opzione (niente generazione) -> fattibile anche a bassa velocita'.
-Serve a capire se la quantizzazione int4 ha lasciato il modello "tale" rispetto ai
-punteggi PUBBLICATI di GLM-5.2 (e, per contesto, Claude/GPT).
+Quality-validation harness for the GLM-5.2 C engine (int4 streaming).
+Runs OUR model on the same standard LLM benchmarks (EleutherAI
+lm-evaluation-harness style) using the **log-likelihood** of the multiple-choice
+answers: a single forward per option (no generation) -> feasible even at low speed.
+It tells whether int4 quantization left the model "intact" relative to GLM-5.2's
+PUBLISHED scores (and, for context, Claude/GPT).
 
-Dipendenze: solo `tokenizers` + il binario ./glm. I dataset si leggono da JSONL locali
-(uno per task) prodotti da `tools/fetch_benchmarks.py`. Formato di ogni riga JSONL:
+Dependencies: only `tokenizers` + the ./glm binary. Datasets are read from local JSONL
+(one per task) produced by `tools/fetch_benchmarks.py`. Format of each JSONL line:
     {"ctx": "...", "choices": ["...","..."], "gold": 0}
-Cosi' la harness e' offline e deterministica.
+This keeps the harness offline and deterministic.
 
-USO:
-  # 1) (una volta, quando hai rete) scarica i benchmark in ./bench/*.jsonl
+USAGE:
+  # 1) (once, when you have network) download the benchmarks into ./bench/*.jsonl
   python3 tools/fetch_benchmarks.py --out ./bench --tasks hellaswag,arc_challenge,mmlu --limit 200
-  # 2) plumbing test della meccanica (senza motore):
+  # 2) plumbing test of the mechanics (without the engine):
   python3 tools/eval_glm.py --snap /home/vincenzo/glm52_i4 --data ./bench --tasks smoke --dry
-  # 3) validazione vera quando il modello e' pronto:
+  # 3) real validation once the model is ready:
   python3 tools/eval_glm.py --snap /home/vincenzo/glm52_i4 --data ./bench \
                       --tasks hellaswag,arc_challenge,mmlu --limit 40 --ram 15
-  # leve di ricerca: passate al motore via env
+  # research knobs: passed to the engine via env
   TOPP=0.9 python3 tools/eval_glm.py --snap /home/vincenzo/glm52_i4 --data ./bench --tasks mmlu --ram 15
 """
 import os, sys, subprocess, argparse, random, json, tempfile, time
 
-# mini-set OFFLINE per testare la meccanica (NON misura qualita': domande banali)
+# OFFLINE mini-set to test the mechanics (does NOT measure quality: trivial questions)
 SMOKE = [
     {"ctx": "The capital of France is", "choices": [" Paris", " Berlin", " Rome"], "gold": 0},
     {"ctx": "2 + 2 =", "choices": [" 4", " 5", " 7"], "gold": 0},
     {"ctx": "The sun rises in the", "choices": [" east", " west", " north"], "gold": 0},
 ]
 
-# punteggi PUBBLICATI (accuracy %), SOLO PER CONTESTO — DA VERIFICARE/AGGIORNARE dalla model card.
+# PUBLISHED scores (accuracy %), FOR CONTEXT ONLY — TO BE VERIFIED/UPDATED from the model card.
 REFERENCE = {
-    "mmlu":          {"GLM-5.2 (pubbl.)": None, "Claude (rif.)": None, "GPT (rif.)": None},
-    "hellaswag":     {"GLM-5.2 (pubbl.)": None},
-    "arc_challenge": {"GLM-5.2 (pubbl.)": None},
+    "mmlu":          {"GLM-5.2 (pub.)": None, "Claude (ref.)": None, "GPT (ref.)": None},
+    "hellaswag":     {"GLM-5.2 (pub.)": None},
+    "arc_challenge": {"GLM-5.2 (pub.)": None},
 }
 
 def load_docs(task, data_dir, limit, seed):
@@ -59,9 +59,9 @@ def build_requests(tk, docs_by_task):
                 cl = len(ctx_ids)
                 while cl > 0 and (cl > len(full) or full[:cl] != ctx_ids[:cl]): cl -= 1
                 cont_ids = full[cl:]
-                if not cont_ids:                       # boundary degenere: forza split esplicito
+                if not cont_ids:                       # degenerate boundary: force an explicit split
                     full = ctx_ids + tk.encode(cont).ids; cl = len(ctx_ids); cont_ids = full[cl:]
-                if cl < 1: cl = 1                        # serve almeno 1 token di contesto
+                if cl < 1: cl = 1                        # at least 1 context token is required
                 reqs.append(f"{cl} {len(full)-cl} " + " ".join(map(str, full)))
                 meta.append((t, qi, oi, len(full) - cl, max(1, len(cont)), gold))
                 perq.setdefault((t, qi), []).append(len(meta) - 1)
@@ -76,7 +76,7 @@ def score_accuracy(tasks, meta, perq, lp):
         for k in qs:
             ridx = perq[k]; gold = meta[ridx[0]][5]
             best  = max(ridx, key=lambda r: lp[r])
-            bestn = max(ridx, key=lambda r: lp[r] / meta[r][4])    # acc_norm: per carattere
+            bestn = max(ridx, key=lambda r: lp[r] / meta[r][4])    # acc_norm: per character
             acc  += (meta[best][2]  == gold)
             accn += (meta[bestn][2] == gold)
         n = len(qs)
@@ -103,9 +103,9 @@ def main():
     ap.add_argument("--selftest", action="store_true", help="verify the scoring calculations")
     a = ap.parse_args()
 
-    if a.selftest:                                   # acc/acc_norm con logprob sintetici
+    if a.selftest:                                   # acc/acc_norm with synthetic logprobs
         meta = [("t",0,0,1,4,1),("t",0,1,1,2,1),("t",0,2,1,8,1)]; perq = {("t",0):[0,1,2]}
-        lp = [-3.0, -2.0, -5.0]                       # opt1 ha lp piu' alto -> acc sceglie 1 (=gold) OK
+        lp = [-3.0, -2.0, -5.0]                       # opt1 has the highest lp -> acc picks 1 (=gold) OK
         score_accuracy(["t"], meta, perq, lp)
         print("selftest OK" if True else ""); return
 

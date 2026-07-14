@@ -1,11 +1,11 @@
 """
-Scarica i benchmark LLM standard e li converte nel formato JSONL della harness
-({"ctx","choices","gold"} per riga). Da eseguire UNA volta, quando hai rete.
-Richiede `datasets`:  pip install --break-system-packages datasets   (o in una venv)
+Downloads the standard LLM benchmarks and converts them into the harness JSONL format
+({"ctx","choices","gold"} per line). To be run ONCE, when you have network.
+Requires `datasets`:  pip install --break-system-packages datasets   (or in a venv)
 
-USO:
+USAGE:
   python3 tools/fetch_benchmarks.py --out ./bench --tasks hellaswag,arc_challenge,arc_easy,mmlu,winogrande,piqa,openbookqa --limit 300
-Poi:
+Then:
   python3 tools/eval_glm.py --snap /home/vincenzo/glm52_i4 --data ./bench --tasks mmlu --limit 40 --ram 15
 """
 import os, json, argparse, random

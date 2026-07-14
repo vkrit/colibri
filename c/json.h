@@ -1,7 +1,7 @@
-/* Parser JSON minimale, header-only. Serve per:
- *  - l'header dei file safetensors (un grande oggetto nome->{dtype,shape,data_offsets})
- *  - ref.json (per leggere prompt_ids / full_ids)
- * Non e' completo (niente unicode \uXXXX, niente notazione esotica) ma copre cio' che serve. */
+/* Minimal, header-only JSON parser. Used for:
+ *  - the header of safetensors files (one big object name->{dtype,shape,data_offsets})
+ *  - ref.json (to read prompt_ids / full_ids)
+ * Not complete (no unicode \uXXXX, no exotic notation) but covers what is needed. */
 #ifndef JSON_H
 #define JSON_H
 #include <stdlib.h>
@@ -15,22 +15,22 @@ typedef struct jval {
     jtype t;
     double num;            /* J_NUM */
     int    boolean;        /* J_BOOL */
-    char  *str;            /* J_STR (NUL-terminata, dentro l'arena) */
-    /* array: figli in [0..len); oggetto: chiavi[] e figli[] in parallelo */
+    char  *str;            /* J_STR (NUL-terminated, inside the arena) */
+    /* array: children in [0..len); object: keys[] and children[] in parallel */
     struct jval **kids;
-    char        **keys;    /* solo per J_OBJ */
+    char        **keys;    /* only for J_OBJ */
     int           len;
 } jval;
 
 typedef struct {
     const char *s;
-    char       *arena;     /* buffer per le stringhe smontate */
+    char       *arena;     /* buffer for the unpacked strings */
     size_t      acap, aoff;
 } jparser;
 
 static char *j_dup(jparser *p, const char *b, int n) {
-    /* ogni stringa ha la sua allocazione: un'arena con realloc sposterebbe il
-     * buffer invalidando i puntatori gia' emessi (use-after-free). */
+    /* each string has its own allocation: an arena with realloc would move the
+     * buffer, invalidating the pointers already emitted (use-after-free). */
     (void)p;
     char *d = (char *)malloc(n + 1);
     memcpy(d, b, n); d[n] = 0;
@@ -50,7 +50,7 @@ static char *j_parse_str_raw(jparser *p) {
     /* assume *p->s == '"' */
     p->s++;
     const char *start = p->s;
-    /* trova la fine gestendo gli escape, poi copia decodificando i casi base */
+    /* find the end handling the escapes, then copy decoding the base cases */
     char tmp[1 << 16]; int n = 0;
     #define J_PUT(ch) do{ if (n < (int)sizeof(tmp)-1) tmp[n++] = (char)(ch); }while(0)
     while (*p->s && *p->s != '"') {
@@ -62,7 +62,7 @@ static char *j_parse_str_raw(jparser *p) {
                 case 'r': c = '\r'; break; case 'b': c = '\b'; break;
                 case 'f': c = '\f'; break; case '/': c = '/'; break;
                 case '\\': c = '\\'; break; case '"': c = '"'; break;
-                case 'u': {  /* \uXXXX -> codepoint UTF-8 (con coppie surrogate) */
+                case 'u': {  /* \uXXXX -> UTF-8 codepoint (with surrogate pairs) */
                     unsigned cp = (unsigned)strtoul((char[]){p->s[0],p->s[1],p->s[2],p->s[3],0}, NULL, 16);
                     p->s += 4;
                     if (cp >= 0xD800 && cp <= 0xDBFF && p->s[0]=='\\' && p->s[1]=='u') {
@@ -128,7 +128,7 @@ static jval *j_parse_val(jparser *p) {
     if (c == 't') { p->s += 4; jval *v = j_new(J_BOOL); v->boolean = 1; return v; }
     if (c == 'f') { p->s += 5; jval *v = j_new(J_BOOL); v->boolean = 0; return v; }
     if (c == 'n') { p->s += 4; return j_new(J_NULL); }
-    /* numero */
+    /* number */
     { char *end; double d = strtod(p->s, &end); p->s = end; jval *v = j_new(J_NUM); v->num = d; return v; }
 }
 

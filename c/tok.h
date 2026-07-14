@@ -1,9 +1,9 @@
-/* Tokenizer GLM-5.2 in C puro (byte-level BPE stile cl100k / tiktoken).
- * Replica fedele di tokenizer.json:
+/* GLM-5.2 tokenizer in pure C (byte-level BPE, cl100k / tiktoken style).
+ * Faithful replica of tokenizer.json:
  *   - model.type = BPE, ignore_merges=true, byte_fallback=false
- *   - pre_tokenizer: regex Split (pattern cl100k) + ByteLevel(add_prefix_space=false)
- *   - merges con rank = ordine nella lista; \p{L}/\p{N}/\s da tok_unicode.h
- *   - added_tokens (speciali e non) trattati come atomici in encode/decode
+ *   - pre_tokenizer: regex Split (cl100k pattern) + ByteLevel(add_prefix_space=false)
+ *   - merges with rank = order in the list; \p{L}/\p{N}/\s from tok_unicode.h
+ *   - added_tokens (special and not) treated as atomic in encode/decode
  * API:
  *   tok_load(&T, "tokenizer.json");
  *   int n = tok_encode(&T, text, len, out_ids, max);
@@ -20,7 +20,7 @@
 #include "json.h"
 #include "tok_unicode.h"
 
-/* ---------- hash map (chiavi binarie con lunghezza) ---------- */
+/* ---------- hash map (binary keys with length) ---------- */
 typedef struct { const char *k; int klen; int v; int used; } ment;
 typedef struct { ment *e; int cap; } hmap;
 static uint64_t tk_fnv(const char *s, int n){ uint64_t h=1469598103934665603ULL;
@@ -39,10 +39,10 @@ static int hm_get(hmap *m, const char *k, int klen){
 
 typedef struct { char *str; int len; int id; } Special;
 typedef struct {
-    hmap vocab;          /* stringa byte-level -> id */
+    hmap vocab;          /* byte-level string -> id */
     hmap merges;         /* "left\0right" -> rank */
-    char **id2str; int *id_added; int n_ids;   /* id -> stringa; id_added=1 se added-token (output letterale) */
-    Special *sp; int nsp;                       /* added tokens, ordinati per lunghezza decrescente */
+    char **id2str; int *id_added; int n_ids;   /* id -> string; id_added=1 if added-token (literal output) */
+    Special *sp; int nsp;                       /* added tokens, sorted by decreasing length */
     uint32_t byte2cp[256]; int byte2cp_len[256]; char byte2str[256][3];
     int16_t cp2byte[1024];
 } Tok;
@@ -54,7 +54,7 @@ static int u8_next(const unsigned char *s, int len, int i, uint32_t *cp){
     if((c>>5)==0x6 && i+1<len){ *cp=((c&0x1F)<<6)|(s[i+1]&0x3F); return 2; }
     if((c>>4)==0xE && i+2<len){ *cp=((c&0x0F)<<12)|((s[i+1]&0x3F)<<6)|(s[i+2]&0x3F); return 3; }
     if((c>>3)==0x1E && i+3<len){ *cp=((c&0x07)<<18)|((s[i+1]&0x3F)<<12)|((s[i+2]&0x3F)<<6)|(s[i+3]&0x3F); return 4; }
-    *cp=c; return 1;   /* byte invalido: trattato come singolo */
+    *cp=c; return 1;   /* invalid byte: treated as a single one */
 }
 static int u8_put(char *o, uint32_t cp){
     if(cp<0x80){ o[0]=cp; return 1; }
@@ -63,7 +63,7 @@ static int u8_put(char *o, uint32_t cp){
     o[0]=0xF0|(cp>>18); o[1]=0x80|((cp>>12)&0x3F); o[2]=0x80|((cp>>6)&0x3F); o[3]=0x80|(cp&0x3F); return 4;
 }
 
-/* ---------- mappa byte<->unicode di GPT-2/ByteLevel ---------- */
+/* ---------- GPT-2/ByteLevel byte<->unicode map ---------- */
 static void tk_build_bytemap(Tok *T){
     for(int i=0;i<1024;i++) T->cp2byte[i]=-1;
     int isdir[256]; memset(isdir,0,sizeof(isdir));
@@ -80,7 +80,7 @@ static void tk_build_bytemap(Tok *T){
     }
 }
 
-/* ---------- caricamento tokenizer.json ---------- */
+/* ---------- tokenizer.json loading ---------- */
 static char *tk_read_file(const char *path, long *out_n){
     FILE *f=fopen(path,"rb"); if(!f){ perror(path); exit(1); }
     fseek(f,0,SEEK_END); long n=ftell(f); fseek(f,0,SEEK_SET);
@@ -99,7 +99,7 @@ static void tok_load(Tok *T, const char *path){
     jval *added=json_get(root,"added_tokens");
     if(!vocab||!merges){ fprintf(stderr,"tokenizer.json: missing model.vocab/merges\n"); exit(1); }
 
-    /* id massimo per dimensionare id2str */
+    /* maximum id to size id2str */
     int maxid=0;
     for(int i=0;i<vocab->len;i++){ int id=(int)vocab->kids[i]->num; if(id>maxid)maxid=id; }
     if(added) for(int i=0;i<added->len;i++){ int id=(int)json_get(added->kids[i],"id")->num; if(id>maxid)maxid=id; }
@@ -107,7 +107,7 @@ static void tok_load(Tok *T, const char *path){
     T->id2str=calloc(T->n_ids,sizeof(char*));
     T->id_added=calloc(T->n_ids,sizeof(int));
 
-    /* vocab: stringa -> id  (capacita' potenza di 2, ~2-3x) */
+    /* vocab: string -> id  (power-of-2 capacity, ~2-3x) */
     int vc=1; while(vc < vocab->len*2) vc<<=1;
     hm_init(&T->vocab, vc);
     for(int i=0;i<vocab->len;i++){
@@ -125,7 +125,7 @@ static void tok_load(Tok *T, const char *path){
         char *key=malloc(ll+1+rl); memcpy(key,l,ll); key[ll]=0; memcpy(key+ll+1,r,rl);
         hm_put(&T->merges, key, ll+1+rl, i);
     }
-    /* added tokens (speciali e non): atomici, output letterale */
+    /* added tokens (special and not): atomic, literal output */
     if(added){
         T->nsp=added->len; T->sp=calloc(T->nsp,sizeof(Special));
         for(int i=0;i<added->len;i++){
@@ -134,23 +134,23 @@ static void tok_load(Tok *T, const char *path){
             T->sp[i].str=content; T->sp[i].len=(int)strlen(content); T->sp[i].id=id;
             T->id2str[id]=content; T->id_added[id]=1;
         }
-        qsort(T->sp,T->nsp,sizeof(Special),cmp_sp_len);   /* match piu' lungo per primo */
+        qsort(T->sp,T->nsp,sizeof(Special),cmp_sp_len);   /* longest match first */
     }
-    /* arena/buf restano allocati: le stringhe (j_dup) sono malloc indipendenti e ci servono vive */
+    /* arena/buf stay allocated: the strings (j_dup) are independent mallocs and we need them alive */
     (void)arena;
 }
 
-/* ---------- BPE su un pezzo: byte grezzi [a,b) -> id appesi a out ---------- */
+/* ---------- BPE on a piece: raw bytes [a,b) -> ids appended to out ---------- */
 static void bpe_piece(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
     int nb=b-a;
-    /* stringa byte-level (concatenazione di byte2str): <=2 byte per byte di input */
+    /* byte-level string (concatenation of byte2str): <=2 bytes per input byte */
     char *s=malloc(2*nb+1); int sl=0;
     for(int i=a;i<b;i++){ int bb=p[i]; memcpy(s+sl,T->byte2str[bb],T->byte2cp_len[bb]); sl+=T->byte2cp_len[bb]; }
     s[sl]=0;
-    /* ignore_merges: se l'intero pezzo e' un token, emettilo diretto */
+    /* ignore_merges: if the whole piece is a token, emit it directly */
     int whole=hm_get(&T->vocab,s,sl);
     if(whole>=0){ if(*no<max) out[(*no)++]=whole; free(s); return; }
-    /* simboli iniziali = codepoint della stringa byte-level */
+    /* initial symbols = codepoints of the byte-level string */
     int *soff=malloc((sl+1)*sizeof(int)), *slen=malloc((sl+1)*sizeof(int)); int ns=0;
     for(int i=0;i<sl;){ uint32_t cp; int k=u8_next((const unsigned char*)s,sl,i,&cp);
         soff[ns]=i; slen[ns]=k; ns++; i+=k; }
@@ -164,7 +164,7 @@ static void bpe_piece(Tok *T, const unsigned char *p, int a, int b, int *out, in
             if(rk>=0 && rk<best){ best=rk; bp=i; }
         }
         if(bp<0) break;
-        slen[bp]=soff[bp+1]+slen[bp+1]-soff[bp];          /* fonde bp e bp+1 (contigui in s) */
+        slen[bp]=soff[bp+1]+slen[bp+1]-soff[bp];          /* merges bp and bp+1 (contiguous in s) */
         for(int j=bp+1;j<ns-1;j++){ soff[j]=soff[j+1]; slen[j]=slen[j+1]; }
         ns--;
     }
@@ -175,8 +175,8 @@ static void bpe_piece(Tok *T, const unsigned char *p, int a, int b, int *out, in
     free(s); free(soff); free(slen); free(kbuf);
 }
 
-/* ---------- pre-tokenizer regex (pattern cl100k) su una porzione di testo ----------
- * Decodifica i codepoint, applica le alternative IN ORDINE, e per ogni pezzo chiama bpe_piece. */
+/* ---------- pre-tokenizer regex (cl100k pattern) over a portion of text ----------
+ * Decodes the codepoints, applies the alternatives IN ORDER, and calls bpe_piece for each piece. */
 static void pretok_chunk(Tok *T, const unsigned char *p, int a, int b, int *out, int *no, int max){
     int nb=b-a; if(nb<=0) return;
     uint32_t *cp=malloc((nb+1)*sizeof(uint32_t)); int *off=malloc((nb+2)*sizeof(int)); int n=0;
@@ -214,18 +214,18 @@ static void pretok_chunk(Tok *T, const unsigned char *p, int a, int b, int *out,
                 i=j; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
             }
         }
-        /* 5) \s*[\r\n]+  -> run di whitespace fino all'ultimo newline contiguo */
+        /* 5) \s*[\r\n]+  -> run of whitespace up to the last contiguous newline */
         {
             int r=i; while(r<n && is_S(cp[r])) r++;
             if(r>i){ int last=-1; for(int j=i;j<r;j++) if(ISNL(cp[j])) last=j;
                 if(last>=0){ i=last+1; bpe_piece(T,p,off[start],off[i],out,no,max); continue; }
-                /* 6) \s+(?!\S): se seguito da non-spazio lascia l'ultimo ws, altrimenti prendi tutto */
+                /* 6) \s+(?!\S): if followed by a non-space leave the last ws, otherwise take everything */
                 int end = (r<n) ? r-1 : r;
-                if(end<=i) end=i+1;                 /* \s+ minimo 1 (fallback alt 7) */
+                if(end<=i) end=i+1;                 /* \s+ minimum 1 (fallback alt 7) */
                 i=end; bpe_piece(T,p,off[start],off[i],out,no,max); continue;
             }
         }
-        i++;  /* salvagente: non dovrebbe accadere */
+        i++;  /* safety net: should not happen */
         bpe_piece(T,p,off[start],off[i],out,no,max);
     }
     #undef ISNL
@@ -233,11 +233,11 @@ static void pretok_chunk(Tok *T, const unsigned char *p, int a, int b, int *out,
     free(cp); free(off);
 }
 
-/* ---------- encode: testo -> id (split sugli added token, poi pretok+BPE) ---------- */
+/* ---------- encode: text -> id (split on the added tokens, then pretok+BPE) ---------- */
 static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
     const unsigned char *p=(const unsigned char*)text; int no=0; int i=0;
     while(i<len){
-        /* prossima occorrenza di un added-token a partire da >= i (match piu' lungo) */
+        /* next occurrence of an added-token starting from >= i (longest match) */
         int hitpos=-1, hitlen=0, hitid=-1;
         for(int j=i;j<len && hitpos<0;j++){
             for(int k=0;k<T->nsp;k++){
@@ -254,13 +254,13 @@ static int tok_encode(Tok *T, const char *text, int len, int *out, int max){
     return no;
 }
 
-/* id di un added-token dato il suo contenuto (es. "<|endoftext|>"); -1 se assente */
+/* id of an added-token given its content (e.g. "<|endoftext|>"); -1 if absent */
 static int tok_id_of(Tok *T, const char *content){
     for(int i=0;i<T->nsp;i++) if(!strcmp(T->sp[i].str,content)) return T->sp[i].id;
     return -1;
 }
 
-/* ---------- decode: id -> testo (byte-level inverso; added token letterali) ---------- */
+/* ---------- decode: id -> text (inverse byte-level; literal added tokens) ---------- */
 static int tok_decode(Tok *T, const int *ids, int n, char *out, int max){
     int o=0;
     for(int i=0;i<n;i++){

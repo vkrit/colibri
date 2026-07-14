@@ -1,8 +1,8 @@
-/* compat.h — shim di portabilita' per piattaforme non-Linux (oggi: macOS / Apple Silicon,
+/* compat.h — portability shim for non-Linux platforms (today: macOS / Apple Silicon,
  * Windows 11 x86-64 via MinGW-w64).
- * Su Linux questo header e' un NO-OP totale: nessun simbolo definito o ridefinito,
- * zero impatto sul percorso x86 esistente.
- * Regola: ogni differenza di piattaforma vive QUI; i .c restano puliti. */
+ * On Linux this header is a total NO-OP: no symbol defined or redefined,
+ * zero impact on the existing x86 path.
+ * Rule: every platform difference lives HERE; the .c files stay clean. */
 #ifndef COMPAT_H
 #define COMPAT_H
 
@@ -11,12 +11,12 @@
 #include <unistd.h>
 #include <sys/types.h>
 
-/* --- posix_fadvise: assente su macOS ---
- * WILLNEED -> F_RDADVISE (readahead esplicito: stessa semantica).
- * DONTNEED -> no-op: XNU non espone un drop mirato per-range; la sua unified
- *             buffer cache si autoregola sotto pressione. Il motore usa DONTNEED
- *             solo come consiglio, quindi ignorarlo e' corretto (e su una macchina
- *             con molta RAM tenere le pagine e' proprio cio' che si vuole). */
+/* --- posix_fadvise: absent on macOS ---
+ * WILLNEED -> F_RDADVISE (explicit readahead: same semantics).
+ * DONTNEED -> no-op: XNU exposes no targeted per-range drop; its unified
+ *             buffer cache self-regulates under pressure. The engine uses DONTNEED
+ *             only as a hint, so ignoring it is correct (and on a machine
+ *             with plenty of RAM keeping the pages is exactly what you want). */
 #ifndef POSIX_FADV_NORMAL
 #define POSIX_FADV_NORMAL      0
 #define POSIX_FADV_RANDOM      1
@@ -36,11 +36,11 @@ static inline int compat_fadvise(int fd, off_t off, off_t len, int advice){
 }
 #define posix_fadvise compat_fadvise
 
-/* --- O_DIRECT: assente su macOS ---
- * L'equivalente e' F_NOCACHE sul fd (bypass della unified buffer cache).
- * compat_open_direct() apre il fd "gemello" senza cache, come il twin O_DIRECT
- * di st.h. Le pread allineate a 4K del chiamante restano valide: F_NOCACHE non
- * impone vincoli di allineamento. */
+/* --- O_DIRECT: absent on macOS ---
+ * The equivalent is F_NOCACHE on the fd (bypasses the unified buffer cache).
+ * compat_open_direct() opens the "twin" fd without cache, like the O_DIRECT twin
+ * in st.h. The caller's 4K-aligned preads stay valid: F_NOCACHE imposes no
+ * alignment constraints. */
 static inline int compat_open_direct(const char *path){
     int fd = open(path, O_RDONLY);
     if(fd>=0) fcntl(fd, F_NOCACHE, 1);
@@ -107,9 +107,9 @@ static inline int compat_open_direct(const char *path){
 #define posix_fadvise(fd,off,len,advice) do{(void)(fd);(void)(off);(void)(len);(void)(advice);}while(0)
 
 /* --- pread -> ReadFile + OVERLAPPED su raw OS handle ---
- * Thread-safe (no shared seek position). Gestisce offset >4 GB e chunking
- * per letture >2 GB (anche se i tensori individuali sono nell'ordine dei
- * MB-centinaia di MB, il wrapper e' robusto per ogni taglia). */
+ * Thread-safe (no shared seek position). Handles offsets >4 GB and chunking
+ * for reads >2 GB (even though individual tensors are on the order of
+ * MB to hundreds of MB, the wrapper is robust for any size). */
 static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
     intptr_t osfh = _get_osfhandle(fd);
     if(osfh == -1 || osfh == -2){ errno = EBADF; return -1; }
@@ -136,12 +136,12 @@ static inline ssize_t compat_pread(int fd, void *buf, size_t n, off_t off){
 }
 #define pread(fd,buf,n,off) compat_pread(fd,buf,n,off)
 
-/* --- mlock -> VirtualLock con crescita del working set ---
- * VirtualLock fallisce oltre il working set MINIMO del processo (default ~qualche
- * centinaio di KB): prima si allarga il working set di len + margine, poi si blocca.
- * Best effort come mlock su Linux: -1 su fallimento, il chiamante decide (pin_wire
- * lo tratta come non-fatale). SeIncreaseWorkingSetPrivilege e' concesso agli utenti
- * standard di default. */
+/* --- mlock -> VirtualLock with working-set growth ---
+ * VirtualLock fails beyond the process's MINIMUM working set (default ~a few
+ * hundred KB): first grow the working set by len + margin, then lock.
+ * Best effort like mlock on Linux: -1 on failure, the caller decides (pin_wire
+ * treats it as non-fatal). SeIncreaseWorkingSetPrivilege is granted to standard
+ * users by default. */
 static inline int compat_mlock(const void *addr, size_t len){
     HANDLE p = GetCurrentProcess();
     SIZE_T mn = 0, mx = 0;
@@ -156,11 +156,11 @@ static inline int compat_munlock(const void *addr, size_t len){
 }
 
 /* --- posix_memalign -> _aligned_malloc ---
- * ATTN: memoria allocata con _aligned_malloc DEVE essere liberata con
- * _aligned_free, NON con free(). Vedi compat_aligned_free sotto.
- * Audit: l'unico sito che libera memoria aligned e' free(s->slab) in
- * glm.c:892 (cambiato in compat_aligned_free). s->fslab usa falloc()
- * (malloc semplice) -> il suo free() resta plain. */
+ * ATTN: memory allocated with _aligned_malloc MUST be freed with
+ * _aligned_free, NOT with free(). See compat_aligned_free below.
+ * Audit: the only site that frees aligned memory is free(s->slab) in
+ * glm.c:892 (changed to compat_aligned_free). s->fslab uses falloc()
+ * (plain malloc) -> its free() stays plain. */
 #ifndef ENOMEM
 #define ENOMEM 12
 #endif
@@ -171,13 +171,13 @@ static inline int compat_posix_memalign(void **memptr, size_t alignment, size_t 
 }
 #define posix_memalign(memptr,alignment,size) compat_posix_memalign(memptr,alignment,size)
 
-/* matching free per memoria aligned di _aligned_malloc */
+/* matching free for aligned memory from _aligned_malloc */
 #define compat_aligned_free _aligned_free
 
 /* --- meminfo: GlobalMemoryStatusEx ---
- * ullAvailPhys ~ MemAvailable di Linux (include standby/free/zero pages —
- * pagine recuperabili senza swap). Guida il cap automatico della cache
- * expert: se sbagliato, la cache e' mis-sized → swap thrash o OOM. */
+ * ullAvailPhys ~ Linux's MemAvailable (includes standby/free/zero pages —
+ * pages reclaimable without swap). Drives the automatic cap of the expert
+ * cache: if wrong, the cache is mis-sized → swap thrash or OOM. */
 static inline void compat_meminfo(double *total_gb, double *avail_gb){
     MEMORYSTATUSEX msx = {0};
     msx.dwLength = sizeof(msx);
@@ -189,10 +189,10 @@ static inline void compat_meminfo(double *total_gb, double *avail_gb){
     }
 }
 
-/* --- rename -> MoveFileEx (CRT rename EEXIST se destinazione esiste) ---
- * stats_dump_q chiama rename(tmp, path) OGNI turno di serve: dopo il primo
- * write il file esiste gia', e CRT rename fallisce silenziosamente,
- * affamando la pipeline REPIN/heat/PIN del suo segnale persistente. */
+/* --- rename -> MoveFileEx (CRT rename EEXIST if destination exists) ---
+ * stats_dump_q calls rename(tmp, path) on EVERY serve turn: after the first
+ * write the file already exists, and CRT rename fails silently,
+ * starving the REPIN/heat/PIN pipeline of its persistent signal. */
 static inline int compat_rename(const char *old, const char *new){
     return MoveFileExA(old, new, MOVEFILE_REPLACE_EXISTING) ? 0 : -1;
 }
@@ -202,7 +202,7 @@ static inline int compat_rename(const char *old, const char *new){
 #define getpid() _getpid()
 
 /* --- rss_gb: getrusage -> GetProcessMemoryInfo ---
- * ru_maxrss in KB (come Linux): rss_gb() divide per 1e6 → GB corretti. */
+ * ru_maxrss in KB (like Linux): rss_gb() divides by 1e6 → correct GB. */
 #include <psapi.h>
 #pragma comment(lib, "psapi.lib")
 struct rusage { long ru_maxrss; };
@@ -236,12 +236,12 @@ static inline ssize_t compat_getline(char **lineptr, size_t *n, FILE *stream){
 #define getline(lineptr,n,stream) compat_getline(lineptr,n,stream)
 
 /* --- O_DIRECT -> FILE_FLAG_NO_BUFFERING ---
- * Apre il fd "gemello" senza cache del file system, come il twin O_DIRECT di
- * st.h su Linux e F_NOCACHE su macOS. Stesso contratto: offset, lunghezza e
- * buffer del chiamante devono essere allineati a 4K (gli slab expert usano
- * posix_memalign(4096) e il percorso DIRECT=1 del motore allinea gia' offset
- * e len); richieste non allineate falliscono con -1, mai dati corrotti.
- * Il fd si usa con la normale pread() (compat_pread -> ReadFile+OVERLAPPED). */
+ * Opens the "twin" fd without file-system cache, like the O_DIRECT twin in
+ * st.h on Linux and F_NOCACHE on macOS. Same contract: the caller's offset, length
+ * and buffer must be 4K-aligned (the expert slabs use
+ * posix_memalign(4096) and the engine's DIRECT=1 path already aligns offset
+ * and len); unaligned requests fail with -1, never corrupt data.
+ * The fd is used with the normal pread() (compat_pread -> ReadFile+OVERLAPPED). */
 static inline int compat_open_direct(const char *path){
     HANDLE h = CreateFileA(path, GENERIC_READ,
                            FILE_SHARE_READ|FILE_SHARE_WRITE|FILE_SHARE_DELETE,
@@ -252,10 +252,10 @@ static inline int compat_open_direct(const char *path){
     return fd;
 }
 
-/* --- dimensione file da fd: GetFileSizeEx ---
- * La lseek(SEEK_END) del CRT ritorna -1 sui fd NO_BUFFERING (misurato su
- * UCRT): la dimensione si chiede direttamente al kernel. Funziona su
- * qualsiasi fd (buffered o direct). -1 su errore. */
+/* --- file size from fd: GetFileSizeEx ---
+ * The CRT's lseek(SEEK_END) returns -1 on NO_BUFFERING fds (measured on
+ * UCRT): ask the kernel for the size directly. Works on
+ * any fd (buffered or direct). -1 on error. */
 static inline off_t compat_fsize(int fd){
     intptr_t osfh = _get_osfhandle(fd);
     if(osfh == -1 || osfh == -2) return -1;
@@ -273,13 +273,13 @@ static inline int compat_setenv(const char *name, const char *value, int overwri
 
 #endif /* _WIN32 */
 
-/* --- compat_aligned_free su piattaforme diverse da Windows ---
- * Su Linux/macOS, posix_memalign usa free() normale. */
+/* --- compat_aligned_free on platforms other than Windows ---
+ * On Linux/macOS, posix_memalign uses the normal free(). */
 #ifndef compat_aligned_free
 #define compat_aligned_free free
 #endif
 
-/* --- COMPAT_O_RDONLY: O_RDONLY con O_BINARY su Windows, O_RDONLY puro altrove --- */
+/* --- COMPAT_O_RDONLY: O_RDONLY with O_BINARY on Windows, plain O_RDONLY elsewhere --- */
 #ifndef COMPAT_O_RDONLY
 #define COMPAT_O_RDONLY O_RDONLY
 #endif

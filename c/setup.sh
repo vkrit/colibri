@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
-# colibrì — installazione su una macchina nuova (Linux x86-64, macOS, Windows/MinGW).
-# Compila il motore e fa un self-test. Il MODELLO (~372 GB int4) va copiato a parte
-# o rigenerato con: coli convert --model <dir-su-ext4/NVMe>
+# colibrì — installation on a new machine (Linux x86-64, macOS, Windows/MinGW).
+# Builds the engine and runs a self-test. The MODEL (~372 GB int4) must be copied separately
+# or regenerated with: coli convert --model <dir-on-ext4/NVMe>
 set -e
 cd "$(dirname "$0")"
 echo "🐦 colibrì — setup"
 
 UNAME_S=$(uname -s)
 
-# 1) dipendenze
+# 1) dependencies
 command -v make >/dev/null || { echo "make is missing"; exit 1; }
 case "$UNAME_S" in
 Darwin)
@@ -30,23 +30,23 @@ MINGW*|MSYS*)
     ;;
 esac
 
-# 2) build: nativa (veloce, per QUESTA macchina). Per un binario da distribuire: make portable
+# 2) build: native (fast, for THIS machine). For a binary to distribute: make portable
 echo "  building (ARCH=${ARCH:-native})…"
 make -s glm ARCH="${ARCH:-native}"
 
-# 3) self-test sull'oracolo tiny, se presente
+# 3) self-test on the tiny oracle, if present
 if [ -d glm_tiny ] && [ -f ref_glm.json ]; then
     r=$(SNAP=./glm_tiny TF=1 ./glm 64 16 16 2>/dev/null | grep -oE "[0-9]+/[0-9]+ positions" || true)
     echo "  engine self-test: ${r:-?}  (expected 32/32)"
 fi
 
-# 4) info macchina (la velocità dipende da QUESTI due numeri, non dalla GPU)
+# 4) machine info (speed depends on THESE two numbers, not on the GPU)
 case "$UNAME_S" in
 Darwin)
     ram=$(( $(sysctl -n hw.memsize) / 1000000000 ))
     ;;
 MINGW*|MSYS*)
-    # MSYS2 fornisce /proc/meminfo come symlink (più affidabile di wmic, deprecato)
+    # MSYS2 provides /proc/meminfo as a symlink (more reliable than wmic, which is deprecated)
     ram=$(awk '/MemTotal/{printf "%.0f", $2/1e6}' /proc/meminfo 2>/dev/null || echo "?")
     ;;
 *)

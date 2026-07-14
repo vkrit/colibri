@@ -1,7 +1,7 @@
-/* Microbench: banda in lettura RANDOM con blocchi tipo-expert (~19 MB int4).
- * Misura cio' che fa il motore davvero: N thread che leggono in parallelo
- * (expert_load sotto omp parallel for), buffered oppure O_DIRECT.
- * uso: ./iobench <file_grande> [blocco_MB] [n_letture] [threads] [direct 0/1]
+/* Microbench: RANDOM read bandwidth with expert-like blocks (~19 MB int4).
+ * Measures what the engine really does: N threads reading in parallel
+ * (expert_load under omp parallel for), buffered or O_DIRECT.
+ * usage: ./iobench <big_file> [block_MB] [n_reads] [threads] [direct 0/1]
  * build: gcc -O2 -fopenmp iobench.c -o iobench */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -41,17 +41,17 @@ int main(int argc,char**argv){
 #endif
     if(fd<0){perror("open");return 1;}
 #ifdef _WIN32
-    off_t sz=compat_fsize(fd);     /* CRT lseek(SEEK_END) ritorna -1 sui fd NO_BUFFERING */
+    off_t sz=compat_fsize(fd);     /* CRT lseek(SEEK_END) returns -1 on NO_BUFFERING fds */
 #else
     off_t sz=lseek(fd,0,SEEK_END);
 #endif
     if(sz<blk*2){fprintf(stderr,"file is too small\n");return 1;}
-    /* offset random pre-generati (stessi per ogni configurazione: srand fisso).
-     * 30 bit di rand combinati: su Windows RAND_MAX=32767 e un singolo rand()*4096
-     * copre solo i primi 134 MB del file (tutti in page cache = misura falsa). */
+    /* random offsets pre-generated (the same for every configuration: fixed srand).
+     * 30 bits of rand combined: on Windows RAND_MAX=32767 and a single rand()*4096
+     * covers only the first 134 MB of the file (all in page cache = false measurement). */
     off_t *offs=malloc(n*sizeof(off_t)); srand(1234);
     for(int i=0;i<n;i++){ off_t r30=((off_t)rand()<<15)|rand(); off_t o=(r30*4096)%(sz-blk); offs[i]=o&~4095L; }
-    double t0=now(); int64_t tot=0;   /* long e' 32-bit su Windows (LLP64): >2GB andava in overflow */
+    double t0=now(); int64_t tot=0;   /* long is 32-bit on Windows (LLP64): >2GB used to overflow */
     #pragma omp parallel num_threads(nth) reduction(+:tot)
     {
         void *buf; if(posix_memalign(&buf,4096,blk)){perror("memalign");exit(1);}
@@ -60,7 +60,7 @@ int main(int argc,char**argv){
             ssize_t r=pread(fd,buf,blk,offs[i]);
             if(r<0) perror("pread"); else tot+=r;
         }
-        compat_aligned_free(buf);   /* su Windows posix_memalign=_aligned_malloc: free() corrompe l'heap */
+        compat_aligned_free(buf);   /* on Windows posix_memalign=_aligned_malloc: free() corrupts the heap */
     }
     double dt=now()-t0;
     printf("%s x%d threads: %d reads x %ldMB = %.1f GB in %.2fs -> %.2f GB/s (%.1f effective ms/block)\n",

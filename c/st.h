@@ -1,9 +1,9 @@
-/* Indicizzazione e lettura on-demand di tensori da piu' file safetensors.
- * Equivale a Shards in engine.py, ma:
- *   - legge con pread (niente mmap) + posix_fadvise(DONTNEED) -> le pagine NON
- *     restano residenti nel processo. E' la correzione del bug di RSS: cosi' la
- *     RAM di picco resta densa+cache, non l'intero modello. (vedi memoria mmap-rss-bug)
- *   - converte sempre in float32 in uscita (BF16/F16/F32 supportati). */
+/* On-demand indexing and reading of tensors from multiple safetensors files.
+ * Equivalent to Shards in engine.py, but:
+ *   - reads with pread (no mmap) + posix_fadvise(DONTNEED) -> the pages do NOT
+ *     stay resident in the process. This is the RSS bug fix: this way the
+ *     peak RAM stays dense+cache, not the whole model. (see memory mmap-rss-bug)
+ *   - always converts to float32 on output (BF16/F16/F32 supported). */
 #ifndef ST_H
 #define ST_H
 #define _GNU_SOURCE
@@ -20,7 +20,7 @@
 typedef struct {
     char   *name;
     int     fd;
-    int64_t off;       /* offset assoluto del dato dentro al file */
+    int64_t off;       /* absolute offset of the data within the file */
     int64_t nbytes;
     int     dtype;     /* 0=BF16 1=F16 2=F32 */
     int64_t numel;
@@ -30,12 +30,12 @@ typedef struct {
     st_tensor *t;
     int        n, cap;
     int        fds[512];
-    int        dfds[512];  /* gemelli O_DIRECT (aperti pigramente): -2 = non ancora provato */
+    int        dfds[512];  /* O_DIRECT twins (opened lazily): -2 = not yet attempted */
     char      *paths[512];
     int        nfd;
-    int       *hidx;      /* hash map nome->indice (open addressing): con ~120k tensori
-                           * (GLM: 256 expert x 78 layer x 3 x 2) la scansione lineare
-                           * costava decine di secondi/token (misurato sul primo run reale) */
+    int       *hidx;      /* hash map name->index (open addressing): with ~120k tensors
+                           * (GLM: 256 experts x 78 layers x 3 x 2) the linear scan
+                           * cost tens of seconds/token (measured on the first real run) */
     int        hcap;
 } shards;
 #define ST_MAX_SHARDS 512
@@ -50,7 +50,7 @@ static int st_dtype_code(const char *s) {
     if (!strcmp(s, "BF16")) return 0;
     if (!strcmp(s, "F16"))  return 1;
     if (!strcmp(s, "F32"))  return 2;
-    if (!strcmp(s, "U8"))   return 3;   /* dati quantizzati (int4 packed / int8) */
+    if (!strcmp(s, "U8"))   return 3;   /* quantized data (int4 packed / int8) */
     if (!strcmp(s, "I8"))   return 3;
     fprintf(stderr, "unsupported dtype: %s\n", s); exit(1);
 }
@@ -63,7 +63,7 @@ static inline float f16_to_f32(uint16_t h) {
     uint32_t exp  = (h >> 10) & 0x1F;
     uint32_t man  = h & 0x3FF;
     uint32_t u;
-    if (exp == 0) {            /* subnormale o zero */
+    if (exp == 0) {            /* subnormal or zero */
         if (man == 0) u = sign;
         else { exp = 127 - 15 + 1; while (!(man & 0x400)) { man <<= 1; exp--; } man &= 0x3FF; u = sign | (exp << 23) | (man << 13); }
     } else if (exp == 0x1F) {  /* inf/nan */
@@ -80,34 +80,34 @@ static int st_open_fd(shards *S, const char *path) {
     if (fd < 0) { perror(path); exit(1); }
     S->paths[S->nfd] = strdup(path); S->fds[S->nfd] = fd;
 #ifdef O_DIRECT
-    S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager: lookup poi thread-safe */
+    S->dfds[S->nfd] = open(path, COMPAT_O_RDONLY | O_DIRECT);   /* eager: lookup is then thread-safe */
 #elif defined(__APPLE__) || defined(_WIN32)
     S->dfds[S->nfd] = compat_open_direct(path);          /* macOS: F_NOCACHE; Windows: NO_BUFFERING */
 #else
-    S->dfds[S->nfd] = -1;                                /* niente equivalente: solo buffered */
+    S->dfds[S->nfd] = -1;                                /* no equivalent: buffered only */
 #endif
     S->nfd++;
     return fd;
 }
 
-/* fd gemello O_DIRECT dello stesso file (bypassa la page cache: il buffered read su
- * ext4-in-VHDX si strozza a ~0.8 GB/s, O_DIRECT arriva a 2.3+; misurato). -1 se non disponibile. */
+/* O_DIRECT twin fd of the same file (bypasses the page cache: buffered read on
+ * ext4-in-VHDX chokes at ~0.8 GB/s, O_DIRECT reaches 2.3+; measured). -1 if unavailable. */
 static int st_direct_fd(shards *S, int fd) {
     for (int i = 0; i < S->nfd; i++) if (S->fds[i] == fd) return S->dfds[i];
     return -1;
 }
 
-/* indicizza tutti i model-*.safetensors in snap_dir */
+/* index all model-*.safetensors in snap_dir */
 static void st_init(shards *S, const char *snap_dir) {
     memset(S, 0, sizeof(*S));
     S->cap = 4096; S->t = calloc(S->cap, sizeof(st_tensor));
-    /* raccoglie ordinatamente i nomi dei file shard */
+    /* collect the shard file names in order */
     static char files[ST_MAX_SHARDS][1024]; int nf = 0;
     DIR *d = opendir(snap_dir); struct dirent *e;
     if (!d) { perror(snap_dir); exit(1); }
     while ((e = readdir(d))) {
         const char *dot = strrchr(e->d_name, '.');
-        if (dot && !strcmp(dot, ".safetensors")) {  /* model.safetensors o model-0000N-of-... */
+        if (dot && !strcmp(dot, ".safetensors")) {  /* model.safetensors or model-0000N-of-... */
             if (nf >= ST_MAX_SHARDS) { fprintf(stderr, "too many shards (>%d): raise ST_MAX_SHARDS\n", ST_MAX_SHARDS); exit(1); }
             snprintf(files[nf++], 1024, "%s/%s", snap_dir, e->d_name);
         }
@@ -140,10 +140,10 @@ static void st_init(shards *S, const char *snap_dir) {
             t->name = strdup(name); t->fd = fd; t->off = data_start + a0;
             t->nbytes = b0 - a0; t->dtype = st_dtype_code(dt->str); t->numel = numel;
         }
-        free(arena); /* i jval restano leakati: ok, una tantum all'avvio */
+        free(arena); /* the jvals stay leaked: fine, one-time at startup */
         free(hdr);
     }
-    /* indice hash costruito a fine indicizzazione (gli indici restano validi dopo i realloc) */
+    /* hash index built at the end of indexing (the indices stay valid after the reallocs) */
     S->hcap = 1; while (S->hcap < S->n * 2) S->hcap <<= 1;
     S->hidx = malloc(S->hcap * sizeof(int));
     for (int i = 0; i < S->hcap; i++) S->hidx[i] = -1;
@@ -169,17 +169,17 @@ static st_tensor *st_find(shards *S, const char *name) {
 }
 static int st_has(shards *S, const char *name) { return st_find(S, name) != NULL; }
 
-/* prefetch ASINCRONO: dice al kernel di iniziare a leggere le pagine del tensore in
- * background (readahead). Serve a sovrapporre l'I/O degli expert col calcolo: si
- * prefetcha tutto il set di expert di un layer, poi le pread sincrone trovano la cache
- * gia' calda. No-op se il tensore non esiste (es. il primo .qs prima della lettura). */
+/* ASYNCHRONOUS prefetch: tells the kernel to start reading the tensor's pages in
+ * the background (readahead). Serves to overlap expert I/O with computation: prefetch
+ * the whole expert set of a layer, then the synchronous preads find the cache
+ * already warm. No-op if the tensor does not exist (e.g. the first .qs before the read). */
 static void st_prefetch(shards *S, const char *name) {
     st_tensor *t = st_find(S, name);
     if (t) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_WILLNEED);
 }
 
-/* legge un tensore in un buffer float32 fornito dal chiamante (numel float).
- * drop=1 -> consiglia al kernel di scartare le pagine (per gli expert in streaming). */
+/* reads a tensor into a float32 buffer provided by the caller (numel floats).
+ * drop=1 -> advises the kernel to discard the pages (for streaming experts). */
 static int64_t st_read_f32(shards *S, const char *name, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
@@ -204,8 +204,8 @@ static int64_t st_nbytes(shards *S, const char *name) {
     st_tensor *t = st_find(S, name); return t ? t->nbytes : -1;
 }
 
-/* legge i byte GREZZI di un tensore (nessuna conversione di dtype): per i pesi gia'
- * quantizzati int4/int8 del nostro container (dtype U8). drop=1 -> fadvise DONTNEED. */
+/* reads the RAW bytes of a tensor (no dtype conversion): for the already
+ * int4/int8-quantized weights of our container (dtype U8). drop=1 -> fadvise DONTNEED. */
 static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }
@@ -213,9 +213,9 @@ static void st_read_raw(shards *S, const char *name, void *out, int drop) {
     if (drop) posix_fadvise(t->fd, t->off, t->nbytes, POSIX_FADV_DONTNEED);
 }
 
-/* legge una FETTA di un tensore: n_elems a partire dall'elemento elem_off.
- * Serve per gli expert fusi di GLM (un tensore = blocco [E, ...]): si legge il
- * solo expert richiesto via pread del sotto-range, niente lettura dell'intero blocco. */
+/* reads a SLICE of a tensor: n_elems starting from element elem_off.
+ * Serves the fused experts of GLM (one tensor = block [E, ...]): read
+ * only the requested expert via pread of the sub-range, no reading of the whole block. */
 static void st_read_slice_f32(shards *S, const char *name, int64_t elem_off, int64_t n_elems, float *out, int drop) {
     st_tensor *t = st_find(S, name);
     if (!t) { fprintf(stderr, "missing tensor: %s\n", name); exit(1); }

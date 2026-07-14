@@ -1,24 +1,24 @@
 """
-Download dei pesi reali di GLM-5.2 per il motore C — STADIO B.
+Download of the real GLM-5.2 weights for the C engine — STAGE B.
 
-Target: zai-org/GLM-5.2-FP8  (FP8 e4m3, 141 shard, ~756 GB) -> ENTRA nei 926 GB di ext4.
-(La variante bf16 zai-org/GLM-5.2 e' 1.5 TB e NON entra.)
+Target: zai-org/GLM-5.2-FP8  (FP8 e4m3, 141 shards, ~756 GB) -> FITS in the 926 GB of ext4.
+(The bf16 variant zai-org/GLM-5.2 is 1.5 TB and does NOT fit.)
 
-Il motore C leggera' questi safetensors in streaming e li (ri)quantizzera' a int4/int8.
-NB: i pesi sono F8_E4M3 + tensori `*.weight_scale_inv` (blocchi 128x128). Il loader st.h
-deve supportare fp8+block-scale prima di poterli usare (vedi memoria glm52-specs).
+The C engine will read these safetensors in a streaming fashion and (re)quantize them to
+int4/int8. Note: the weights are F8_E4M3 + `*.weight_scale_inv` tensors (128x128 blocks).
+The st.h loader must support fp8+block-scale before they can be used (see memory glm52-specs).
 
-USO:
-    python3 tools/download_glm52.py            # scarica tutto in /home/vincenzo/glm52  (ripartibile)
-    python3 tools/download_glm52.py --check    # solo stima spazio e conteggio file, niente download
+USAGE:
+    python3 tools/download_glm52.py            # download everything into /home/vincenzo/glm52  (resumable)
+    python3 tools/download_glm52.py --check    # space estimate and file count only, no download
 
-Lo scaricamento e' di centinaia di GB e ore: lancialo tu quando il resto e' pronto.
+The download is hundreds of GB and hours: launch it yourself when the rest is ready.
 """
 import os, sys, shutil
 from huggingface_hub import snapshot_download, HfApi
 
 REPO = "zai-org/GLM-5.2-FP8"
-DEST = os.environ.get("GLM_DIR", "/home/vincenzo/glm52")   # su ext4 (/dev/sdd), MAI su /mnt/c
+DEST = os.environ.get("GLM_DIR", "/home/vincenzo/glm52")   # on ext4 (/dev/sdd), NEVER on /mnt/c
 
 def human(n): return f"{n/1e9:.0f} GB"
 
@@ -37,7 +37,7 @@ def download():
     os.makedirs(DEST, exist_ok=True)
     free = shutil.disk_usage(DEST).free
     print(f"Downloading {REPO} -> {DEST}  (free: {human(free)})")
-    # resume_download e' implicito; in caso di interruzione, rilancia e riprende.
+    # resume_download is implicit; on interruption, relaunch and it resumes.
     snapshot_download(
         repo_id=REPO,
         local_dir=DEST,

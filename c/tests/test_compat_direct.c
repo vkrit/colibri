@@ -1,7 +1,7 @@
-/* test_compat_direct.c — O_DIRECT equivalente su Windows: FILE_FLAG_NO_BUFFERING.
- * compat_open_direct(path) deve dare un fd che bypassa la cache del file system,
- * leggibile con pread() a offset/len/buffer allineati a 4K (stesso contratto di
- * O_DIRECT su Linux: richieste non allineate falliscono, mai dati corrotti). */
+/* test_compat_direct.c — O_DIRECT equivalent on Windows: FILE_FLAG_NO_BUFFERING.
+ * compat_open_direct(path) must return an fd that bypasses the file system cache,
+ * readable with pread() at 4K-aligned offset/len/buffer (same contract as
+ * O_DIRECT on Linux: unaligned requests fail, never corrupted data). */
 #include <stdio.h>
 
 #ifndef _WIN32
@@ -30,24 +30,24 @@ int main(void){
     int dfd = compat_open_direct(TMPF);
     if(dfd<0) return fail("compat_open_direct returned -1");
 
-    /* lettura allineata 4K (offset, len, buffer): deve restituire i byte esatti */
+    /* 4K-aligned read (offset, len, buffer): must return the exact bytes */
     void *buf=NULL;
     if(posix_memalign(&buf,4096,64*1024)!=0) return fail("alloc aligned");
     if(pread(dfd, buf, 64*1024, 4096)!=64*1024) return fail("aligned pread size");
     if(memcmp(buf, pat+4096, 64*1024)!=0) return fail("aligned pread data mismatch");
 
-    /* richiesta non allineata: deve fallire (-1), MAI restituire dati sbagliati */
+    /* unaligned request: must fail (-1), MUST NEVER return wrong data */
     ssize_t r = pread(dfd, buf, 64*1024, 1000);
     if(r>0 && memcmp(buf, pat+1000, (size_t)r)!=0) return fail("misaligned read returned wrong data");
 
-    /* dimensione file: lseek(SEEK_END) FALLISCE sui fd NO_BUFFERING (misurato:
-     * ritorna -1); compat_fsize deve funzionare su entrambi i tipi di fd */
+    /* file size: lseek(SEEK_END) FAILS on NO_BUFFERING fds (measured:
+     * returns -1); compat_fsize must work on both kinds of fd */
     if(compat_fsize(dfd)!=(off_t)FSZ) return fail("compat_fsize on direct fd");
     int bfd = open(TMPF, COMPAT_O_RDONLY);
     if(compat_fsize(bfd)!=(off_t)FSZ) return fail("compat_fsize on buffered fd");
     close(bfd);
 
-    /* fd inesistente */
+    /* nonexistent file */
     if(compat_open_direct("no_such_file.tmp")>=0) return fail("open missing file must fail");
     if(compat_fsize(-1)>=0) return fail("compat_fsize on bad fd must be negative");
 

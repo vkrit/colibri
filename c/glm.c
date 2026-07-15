@@ -5772,10 +5772,17 @@ int main(int argc, char **argv){
      * Non e' un bug del motore — vedi #76. */
     { int maxid=0; for(int i=0;i<nfull;i++) if(full[i]>maxid) maxid=full[i];
       if(m.c.vocab>1000 && maxid<1000 && !getenv("REF_FORCE")){
-        fprintf(stderr,"ERRORE: ref_glm.json e' l'oracolo del modello TINY (token max %d, ma il tuo vocab e' %d).\n"
-                       "        Self-test motore:  SNAP=./glm_tiny TF=1 ./glm 64 16 16   (atteso 32/32)\n"
-                       "        Prova reale:       PROMPT=\"Ciao\" NGEN=32 SNAP=<modello> ./glm 64\n"
-                       "        REF_FORCE=1 per eseguire comunque il confronto (senza senso).\n", maxid, m.c.vocab);
+        fprintf(stderr,
+          "ERROR: no PROMPT given, so this is oracle self-test mode — but ref_glm.json is the TINY\n"
+          "       model's oracle (max token %d) and your model's vocab is %d. Nothing to validate here.\n"
+          "         Engine self-test:  SNAP=./glm_tiny TF=1 ./glm 64 16 16      (expect 32/32)\n"
+          "         Real generation:   PROMPT=\"Hello\" NGEN=32 SNAP=<model> ./glm 64\n"
+          "         or:                python coli chat --model <model>\n"
+          "         REF_FORCE=1 to run the comparison anyway (meaningless).\n"
+          "  --- IT ---\n"
+          "  Nessun PROMPT: modo auto-validazione, ma ref_glm.json e' l'oracolo del modello TINY\n"
+          "  (token max %d, il tuo vocab e' %d). Usa PROMPT=... per generare davvero (vedi sopra).\n",
+          maxid, m.c.vocab, maxid, m.c.vocab);
         return 1;
       } }
 

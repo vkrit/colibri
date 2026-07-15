@@ -35,6 +35,7 @@
 #include <sys/resource.h>
 #include <sys/mman.h>                             /* mlock: inchioda le pagine in RAM / wire pages into RAM */
 #include <sys/stat.h>                             /* fstat per mmap degli shard (COLI_MMAP) */
+#include <signal.h>                               /* SIGINT = stop morbido del turno in serve mode */
 #endif
 #include "st.h"
 #include "tok.h"
@@ -3579,12 +3580,34 @@ static void stops_arm(const Cfg *c, int tok_eos){
  * all: storia token (capacita' >= kv+n_new+g_draft+2), kv = token gia' in KV.
  * logit = logits della posizione kv-1 (dal prefill); viene liberato qui.
  * emit(tok,ud) per ogni token emesso. Ritorna i token emessi; *kv_out = nuova kv. */
+/* STOP MORBIDO (serve/chat): SIGINT chiude il turno CORRENTE per la stessa via
+ * del tetto NGEN (stats, usage_save, KV append, sentinella END tutti normali)
+ * invece di uccidere il motore; :more puo' continuare la risposta interrotta.
+ * Il flag e' armato solo nei serve-loop (intr_install): nei run one-shot e in
+ * validazione SIGINT resta il default (morte immediata). Solo POSIX: su
+ * Windows il comportamento di Ctrl-C non cambia.
+ * EN: soft stop (serve/chat): SIGINT ends the CURRENT turn through the same
+ * path as the NGEN cap — stats/usage/KV/END sentinel all normal — instead of
+ * killing the engine; :more can continue the interrupted answer. Armed only
+ * in the serve loops; one-shot runs keep default SIGINT. POSIX only. */
+static volatile sig_atomic_t g_intr=0;
+#if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
+static void intr_sig(int s){ (void)s; g_intr=1; }
+static void intr_install(void){
+    struct sigaction sa; memset(&sa,0,sizeof(sa));
+    sa.sa_handler=intr_sig; sigemptyset(&sa.sa_mask);
+    sa.sa_flags=SA_RESTART;              /* getline/pread non devono vedere EINTR */
+    sigaction(SIGINT,&sa,NULL);
+}
+#else
+static void intr_install(void){}
+#endif
 static int spec_decode(Model *m, int *all, int kv, int n_new, int eos, float *logit,
                        void (*emit)(int,void*), void *ud, int *kv_out){
     Cfg *c=&m->c; int V=c->vocab; int emitted=0, done=0;
     int draft[64]; if(g_draft>63) g_draft=63;
     int carry_ban=-1;                    /* token rifiutato dalla verifica: escluso dal resample */
-    while(emitted<n_new && !done){
+    while(emitted<n_new && !done && !g_intr){   /* g_intr: stessa uscita del tetto n_new */
         int next=pick_tok(logit,V,carry_ban); carry_ban=-1; free(logit); logit=NULL;
         if((eos>=0 && next==eos) || is_stop(next)) break;
         emit(next,ud); all[kv]=next; emitted++; m->n_emit++;
@@ -4290,12 +4313,17 @@ static void run_serve_mux(Model *m, const char *snap){
     setvbuf(stdout, NULL, _IONBF, 0);
 #endif
     setvbuf(stdin,NULL,_IONBF,0);
+    intr_install();                      /* Ctrl-C = chiudi i turni in volo, non il processo */
     printf("\x01\x01READY\x01\x01\nSTAT 0 0.00 0.0 %.2f\n",rss_gb()); fflush(stdout);
     hwinfo_emit(m);
     tiers_emit(m);
     emap_emit(m);
     int eof=0;
     for(;;){
+        if(g_intr){ g_intr=0;            /* stop morbido: ogni request attiva finisce ORA per la
+                                          * via normale di mux_done (DONE+stats+KV coerenti) */
+            for(int i=0;i<nctx;i++) if(req[i].active) mux_done(m,&ctx[i],&req[i]);
+        }
         int active=0; for(int i=0;i<nctx;i++) active+=req[i].active;
         /* Poll stdin for available input without blocking. On POSIX this is
          * select(); on Windows, select() on a pipe handle routes to winsock
@@ -4388,9 +4416,11 @@ static void run_serve(Model *m, const char *snap){
     #define len   (sc->len)
     #define first (sc->first)
     char *line=NULL; size_t cap=0; ssize_t nr; char *buf=malloc(1<<16);
+    intr_install();                      /* Ctrl-C = fine turno, non fine processo */
     printf("\x01\x01" "READY" "\x01\x01\n"); printf("STAT 0 0.00 0.0 %.2f\n", rss_gb()); fflush(stdout);
     tiers_emit(m);
     while((nr=getline(&line,&cap,stdin))>0){
+        g_intr=0;                        /* interruzioni arrivate tra i turni: stantie */
         if(nr>0 && line[nr-1]=='\n') line[--nr]=0;
         if(!strcmp(line,"\x02RESET")){ len=0; first=1; if(m->has_mtp) m->kv_start[m->c.n_layers]=-1;
             kv_disk_reset(m);

@@ -5273,7 +5273,7 @@ int main(int argc, char **argv){
            (g_pilot_real&&coli_uring_set_workers(&g_ub_pilot.ring,uw)))
             fprintf(stderr,"[URING] warning: cannot set io-wq workers=%u: %s\n",uw,strerror(errno));
         fprintf(stderr,"[URING] queued expert I/O active (depth=%d, workers=%u, %s%s)\n",URING_REQ_MAX,uw,
-                g_direct?"O_DIRECT":"buffered",g_pilot_real?", batched PILOT_REAL":"");
+                g_direct?"DIRECT=1":"buffered",g_pilot_real?", batched PILOT_REAL":"");
         if(!g_direct) fprintf(stderr,"[URING] cold NVMe: DIRECT=1 avoids page-cache copy/readahead bottlenecks\n");
 #else
         fprintf(stderr,"URING=1 is supported only on Linux\n"); return 2;

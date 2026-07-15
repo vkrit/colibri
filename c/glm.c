@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <math.h>
 #include <time.h>
 #include <limits.h>
@@ -1325,6 +1326,24 @@ static void *map_of_fd(int fd){
  * pread error aborts the process. fatal=0 (speculative pilot only): the same
  * errors instead abandon the load and return -1 without touching s->eid, so a
  * mispredicted cross-layer prefetch can never kill the server. */
+/* pread completo: gestisce le short-read (POSIX le ammette su file regolari
+ * sotto pressione di memoria) e le EINTR, e riporta un errore ONESTO. perror
+ * stampava "Success" quando pread ritorna un conteggio corto invece di -1
+ * (errno resta 0 dalla syscall precedente) -> messaggio fuorviante nel path
+ * score/bench (#236). Ritorna 0 = ok, -1 = errore reale o EOF. */
+static int pread_full(int fd, void *buf, int64_t n, int64_t off, const char *tag){
+    char *p=buf; int64_t got=0;
+    while(got<n){
+        ssize_t r=pread(fd, p+got, (size_t)(n-got), off+got);
+        if(r<0){ if(errno==EINTR) continue;
+            fprintf(stderr,"%s: %s (off %lld, %lld/%lld bytes)\n",tag,strerror(errno),
+                    (long long)off,(long long)got,(long long)n); return -1; }
+        if(r==0){ fprintf(stderr,"%s: short read at EOF (off %lld, %lld/%lld bytes) — truncated shard?\n",
+                    tag,(long long)off,(long long)got,(long long)n); return -1; }
+        got+=r;
+    }
+    return 0;
+}
 static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
 #ifdef COLI_CUDA
     /* A live REPIN may reuse a GPU-enabled pinned slot for a different expert.
@@ -1451,19 +1470,19 @@ static int expert_load(Model *m, int layer, int eid, ESlot *s, int fatal){
             }
         }
         if(!done){                               /* fallback bufferizzato */
-            if(pread(tw[ord[0]]->fd, s->slab, wtot, off0)!=wtot){ perror("pread expert"); if(fatal) exit(1); return -1; }
+            if(pread_full(tw[ord[0]]->fd, s->slab, wtot, off0, "pread expert")){ if(fatal) exit(1); return -1; }
             pos[ord[0]]=0; pos[ord[1]]=tw[ord[0]]->nbytes; pos[ord[2]]=tw[ord[0]]->nbytes+tw[ord[1]]->nbytes; done=1;
         }
     }
     if(!done){                                   /* non contigui: 3 pread bufferizzate */
         int64_t o=0;
         for(int a=0;a<3;a++){ int k=ord[a];
-            if(pread(tw[k]->fd, s->slab+o, tw[k]->nbytes, tw[k]->off)!=tw[k]->nbytes){ perror("pread expert"); if(fatal) exit(1); return -1; }
+            if(pread_full(tw[k]->fd, s->slab+o, tw[k]->nbytes, tw[k]->off, "pread expert")){ if(fatal) exit(1); return -1; }
             pos[k]=o; o+=tw[k]->nbytes; }
     }
     float *fp[3]; int64_t fo=0;                  /* scale (piccole) */
     for(int k=0;k<3;k++){
-        if(pread(tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off)!=tq[k]->nbytes){ perror("pread qs"); if(fatal) exit(1); return -1; }
+        if(pread_full(tq[k]->fd, (char*)(s->fslab+fo), tq[k]->nbytes, tq[k]->off, "pread qs")){ if(fatal) exit(1); return -1; }
         fp[k]=s->fslab+fo; fo+=tq[k]->nbytes/4; }
     if(g_drop){                                  /* scarta subito le pagine: evita che la page
                                                   * cache in pressione strangoli il throughput */

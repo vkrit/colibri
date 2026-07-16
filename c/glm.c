@@ -724,8 +724,8 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
 #elif defined(__ARM_NEON)
     const uint8x16_t m4q=vdupq_n_u8(0x0F); const int8x16_t b8q=vdupq_n_s8(8);
 #if defined(__ARM_FEATURE_DOTPROD)
-    /* 4 accumulatori indipendenti (vedi dot_i8i8): spezza la catena seriale su acc.
-     * Misurato su M4: 12.4 -> 29.9 GB/s di pesi per core (2.4x). */
+    /* 4 independent accumulators (see dot_i8i8): break the serial chain on acc.
+     * Measured on M4: 12.4 -> 29.9 GB/s of weights per core (2.4x). */
     int32x4_t a0=vdupq_n_s32(0),a1=vdupq_n_s32(0),a2=vdupq_n_s32(0),a3=vdupq_n_s32(0);
     for(;i+64<=I;i+=64){
         uint8x16_t byA=vld1q_u8(w4+(i>>1)), byB=vld1q_u8(w4+(i>>1)+16);
@@ -792,13 +792,11 @@ static inline int32_t dot_i4i8(const uint8_t *w4, const int8_t *x, int I){
     return sum;
 }
 #if defined(__ARM_NEON) && defined(__ARM_FEATURE_MATMUL_INT8)
-/* SMMLA (i8mm): vmmlaq_s32 vede ogni int8x16_t come matrice 2x8 row-major (byte 0-7 =
- * riga 0, byte 8-15 = riga 1) e accumula C += A*B^T nel 2x2 int32: lane0=a0.b0,
- * lane1=a0.b1, lane2=a1.b0, lane3=a1.b1. vcombine di due mezze-righe costruisce la
- * matrice: A = due righe di peso (o,o+1), B = due righe di attivazione (s,s+1), quindi
- * meta' traffico pesi e doppio lavoro per istruzione a S>=2. EN: vmmlaq_s32 treats each
- * int8x16_t as a 2x8 row-major matrix and does C += A*B^T on a 2x2 int32 tile; vcombine
- * of vget_low/high halves builds the 2-row register from two weight/activation rows. */
+/* SMMLA (i8mm): vmmlaq_s32 treats each int8x16_t as a 2x8 row-major matrix (bytes 0-7 =
+ * row 0, bytes 8-15 = row 1) and accumulates C += A*B^T in a 2x2 int32 tile: lane0=a0.b0,
+ * lane1=a0.b1, lane2=a1.b0, lane3=a1.b1. vcombine of two half-rows builds the matrix:
+ * A = two weight rows (o,o+1), B = two activation rows (s,s+1), hence half the weight
+ * traffic and double the work per instruction at S>=2. */
 static inline int32x4_t mm_tile16(int32x4_t acc, int8x16_t wo, int8x16_t wo1,
                                   int8x16_t xs, int8x16_t xs1){
     acc=vmmlaq_s32(acc, vcombine_s8(vget_low_s8(wo), vget_low_s8(wo1)),
@@ -4189,12 +4187,12 @@ static int mt_is_glm(const char *s){
  * A single forward per request (teacher-forcing): no generation -> feasible at low speed. */
 static void run_score(Model *m, const char *snap, const char *path){
     Cfg *c=&m->c; int D=c->hidden;
-    /* prefisso GLM (#108): il modello vede [gMASK]<sop> in testa a OGNI sequenza di training —
-     * scorare stream nudi e' out-of-distribution e deprime/distorce i punteggi. Se il config
-     * dice glm* gli id dei due token vengono chiesti al tokenizer.json dello snapshot (per
-     * GLM-5.2: 154822,154824 — mai fidarsi di costanti cablate, il vocabolario cambia tra
-     * release) e anteposti al CONTESTO delle richieste che non li hanno gia'; chi arriva GIA'
-     * prefissato (eval_glm.py post-#194) passa INTATTO. SCORE_PREFIX=0 -> comportamento nudo. */
+    /* GLM prefix (#108): the model sees [gMASK]<sop> at the head of EVERY training sequence —
+     * scoring bare streams is out-of-distribution and depresses/distorts the scores. If the config
+     * says glm* the two token ids are queried from the snapshot's tokenizer.json (for
+     * GLM-5.2: 154822,154824 — never trust hardcoded constants, the vocabulary changes between
+     * releases) and prepended to the CONTEXT of requests that don't already have them; input that
+     * arrives ALREADY prefixed (eval_glm.py post-#194) passes THROUGH intact. SCORE_PREFIX=0 -> bare behavior. */
     int pfx[2]={-1,-1}, pfx_on=0;
     if(!getenv("SCORE_PREFIX")||atoi(getenv("SCORE_PREFIX"))){
         char *ar=NULL; jval *r=cfg_root(snap,&ar);

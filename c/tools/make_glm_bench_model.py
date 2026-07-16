@@ -101,9 +101,8 @@ def main() -> None:
 
     if args.fp8:
         n_fp8, n_tot = save_fp8_safetensors(sd, output / "model.safetensors")
-        # save_pretrained scrive config.json; nel path FP8 lo bypassiamo, quindi lo scriviamo
-        # a mano (serve al converter e al motore C). EN: save_pretrained writes config.json;
-        # the FP8 path bypasses it, so write it manually (converter + C engine need it).
+        # save_pretrained writes config.json; the FP8 path bypasses it, so write it
+        # manually (the converter and the C engine need it).
         (output / "config.json").write_text(json.dumps(cfg.to_dict()))
         print(f"saved FP8: {n_fp8} e4m3 tensors (+{n_tot - n_fp8} scale_inv sidecars / f32) "
               f"-> {output / 'model.safetensors'}")

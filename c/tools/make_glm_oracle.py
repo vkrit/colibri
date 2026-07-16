@@ -20,9 +20,8 @@ from glm_fp8_emit import (fp8_block_quantize, fp8_block_dequantize, keep_f32,
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--fp8", action="store_true",
-                help="salva in FP8 e4m3 + 128x128 block scale_inv (layout GLM-5.2-FP8) e "
-                     "calcola ref_glm.json sul modello dopo il round-trip FP8. "
-                     "EN: write FP8 e4m3 + block scale_inv, ref computed on FP8-rounded model")
+                help="write FP8 e4m3 + 128x128 block scale_inv (GLM-5.2-FP8 layout) and "
+                     "compute ref_glm.json on the model after the FP8 round-trip")
 args = ap.parse_args()
 
 torch.manual_seed(1234)
@@ -71,10 +70,9 @@ with torch.no_grad():
             layer.mlp.gate.e_score_correction_bias.copy_(
                 torch.linspace(-0.1, 0.1, cfg.n_routed_experts))
 
-# --fp8: round-trip dei pesi quantizzabili per FP8 PRIMA di calcolare il riferimento,
-# cosi' ref_glm.json riflette esattamente il modello FP8 che il converter leggera'.
-# Norme/router/bias (keep_f32) restano a precisione piena. EN: --fp8: round-trip quantizable
-# weights through FP8 before computing the reference, so ref_glm.json matches the FP8 model.
+# --fp8: round-trip the FP8-quantizable weights BEFORE computing the reference,
+# so ref_glm.json matches exactly the FP8 model the converter will read.
+# Norms/router/bias (keep_f32) stay at full precision.
 if args.fp8:
     with torch.no_grad():
         for n, p in model.named_parameters():

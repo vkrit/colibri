@@ -152,9 +152,9 @@ static void st_init(shards *S, const char *snap_dir) {
             jval *dt = json_get(m, "dtype");
             jval *off = json_get(m, "data_offsets");
             jval *shp = json_get(m, "shape");
-            /* un header crafted puo' omettere i campi o dare tipi sbagliati:
-             * senza questi guard si dereferenzia NULL (json_get) o si legge
-             * off->kids[0/1] oltre i limiti dell'array. */
+            /* a crafted header can omit the fields or give wrong types:
+             * without these guards we dereference NULL (json_get) or read
+             * off->kids[0/1] past the array bounds. */
             if (!dt || dt->t != J_STR || !off || off->t != J_ARR || off->len < 2 ||
                 !shp || shp->t != J_ARR) {
                 fprintf(stderr, "%s: tensor '%s' has malformed dtype/data_offsets/shape\n",

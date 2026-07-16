@@ -244,7 +244,7 @@ cuda-bench: backend_cuda.cu backend_cuda.h tests/bench_tensor_core.cu
 	$(NVCC) $(NVCCFLAGS) backend_cuda.cu tests/bench_tensor_core.cu -o backend_cuda_bench$(EXE)
 	./backend_cuda_bench$(EXE)
 
-olmoe$(EXE): olmoe.c st.h json.h compat.h
+olmoe$(EXE): olmoe.c st.h json.h compat.h tok.h tok_unicode.h
 	$(CC) $(CFLAGS) olmoe.c -o olmoe$(EXE) $(LDFLAGS)
 
 # binario portabile da distribuire su altre macchine x86-64

@@ -20,6 +20,7 @@
 #include <sys/sysctl.h>                /* sysctlbyname("hw.memsize") */
 #endif
 #include "st.h"
+#include "tok.h"                       /* tokenizer for PROMPT= text-generation mode */
 
 /* ---------- config ---------- */
 typedef struct {
@@ -462,6 +463,39 @@ static void generate(Model *m, const int *prompt, int np, int n_new, int *out) {
     }
 }
 
+/* PROMPT= mode: tokenize prompt ids[np], generate up to ngen tokens greedily,
+ * stream the detokenized text to stdout, stop on eos. Mirrors generate() but
+ * streams and stops on the end token instead of filling a fixed array. */
+static void run_prompt(Model *m, Tok *T, const int *pids, int np, int ngen, int eos) {
+    Cfg *c = &m->c;
+    m->max_t = np + ngen;
+    m->K = calloc(c->n_layers, sizeof(float*)); m->V = calloc(c->n_layers, sizeof(float*));
+    for (int i = 0; i < c->n_layers; i++) {
+        m->K[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+        m->V[i] = falloc((int64_t)c->n_heads * m->max_t * c->head_dim);
+    }
+    double t0 = now_s();
+    float *logit = step(m, pids, np, 0);            /* PREFILL */
+    double prefill_s = now_s() - t0, tg = now_s();
+    int len = np, gen = 0; char dec[512];
+    for (int s = 0; s < ngen; s++) {
+        int best = 0; float bv = logit[0];
+        for (int i = 1; i < c->vocab; i++) if (logit[i] > bv) { bv = logit[i]; best = i; }
+        free(logit);
+        if (best == eos) break;
+        int dn = tok_decode(T, &best, 1, dec, sizeof(dec) - 1); dec[dn] = 0;
+        fputs(dec, stdout); fflush(stdout);
+        gen++; len++;
+        if (s == ngen - 1) break;
+        int one = best;
+        logit = step(m, &one, 1, len - 1);          /* DECODE */
+    }
+    double dt = now_s() - tg;
+    printf("\n\n[%d tokens · %.2f tok/s · prefill %d tok in %.2fs · %s · RSS %.2f GB]\n",
+           gen, gen / (dt > 0 ? dt : 1e-9), np, prefill_s,
+           m->resident ? "fully resident" : "streaming", rss_gb());
+}
+
 /* ---------- ref.json reading ---------- */
 static int *read_int_array(jval *o, const char *key, int *n_out) {
     jval *a = json_get(o, key);
@@ -479,6 +513,34 @@ int main(int argc, char **argv) {
         fprintf(stderr, "quant_bits must be 2..8 (got %d); OLMoE experts are int8-backed, no f32 mode\n", bits);
         return 1;
     }
+    /* PROMPT= : real text generation (tokenize -> generate -> detokenize, streamed).
+     * Wraps the input in OLMoE's instruct chat format unless COLI_RAW=1.
+     * NGEN=n caps generated tokens (default 256). */
+    const char *user = getenv("PROMPT");
+    if (user) {
+        Model m; model_init(&m, snap, cap, bits);
+        if (m.resident)
+            printf("== OLMoE: FULLY RESIDENT (%d experts/layer in RAM, 0 streaming) · RSS %.2f GB ==\n",
+                   m.c.n_experts, rss_gb());
+        else
+            printf("== OLMoE: STREAMING %d/%d experts/layer · RSS %.2f GB ==\n", m.cap, m.c.n_experts, rss_gb());
+        char tkp[2048]; snprintf(tkp, sizeof(tkp), "%s/tokenizer.json", snap);
+        Tok T; tok_load(&T, tkp);
+        int eos = tok_id_of(&T, "|||IP_ADDRESS|||");   /* OLMoE bos==eos */
+        if (eos < 0) eos = tok_id_of(&T, "<|endoftext|>");
+        /* build the prompt text (chat-wrapped by default) */
+        size_t need = strlen(user) + 64;
+        char *ptext = malloc(need);
+        if (getenv("COLI_RAW")) snprintf(ptext, need, "%s", user);
+        else snprintf(ptext, need, "|||IP_ADDRESS|||<|user|>\n%s\n<|assistant|>\n", user);
+        int cap_ids = 8192; int *pids = malloc(cap_ids * sizeof(int));
+        int np = tok_encode(&T, ptext, (int)strlen(ptext), pids, cap_ids);
+        int ngen = getenv("NGEN") ? atoi(getenv("NGEN")) : 256;
+        run_prompt(&m, &T, pids, np, ngen, eos);
+        free(ptext); free(pids);
+        return 0;
+    }
+
     const char *refpath = argc > 3 ? argv[3] : "ref.json";
 
     FILE *f = fopen(refpath, "rb"); if(!f){perror(refpath);return 1;}

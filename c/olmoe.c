@@ -14,6 +14,10 @@
 #include <time.h>
 #if defined(__APPLE__) || defined(__linux__) || defined(__FreeBSD__)
 #include <sys/resource.h>
+#include <unistd.h>                    /* sysconf: physical RAM on Linux/BSD */
+#endif
+#if defined(__APPLE__)
+#include <sys/sysctl.h>                /* sysctlbyname("hw.memsize") */
 #endif
 #include "st.h"
 
@@ -46,7 +50,8 @@ typedef struct {
     uint64_t clock, hits, miss;
     /* per-layer kv-cache: K,V as [H * maxT * head_dim] */
     float **K, **V; int kv_len, max_t;
-    double dense_load_s;
+    double dense_load_s, warm_s;
+    int cap, resident;                 /* experts/layer kept in RAM; resident=1 -> all fit (no streaming) */
 } Model;
 
 /* ---------- utility ---------- */
@@ -186,12 +191,67 @@ static float *load_t(Model *m, const char *name) {
     return p;
 }
 
+/* physical RAM in bytes, 0 if it can't be determined. */
+static uint64_t phys_ram_bytes(void) {
+#if defined(__APPLE__)
+    uint64_t mem = 0; size_t len = sizeof(mem);
+    if (sysctlbyname("hw.memsize", &mem, &len, NULL, 0) == 0) return mem;
+    return 0;
+#elif defined(_SC_PHYS_PAGES)
+    long pages = sysconf(_SC_PHYS_PAGES), psz = sysconf(_SC_PAGE_SIZE);
+    if (pages > 0 && psz > 0) return (uint64_t)pages * (uint64_t)psz;
+    return 0;
+#else
+    return 0;
+#endif
+}
+
+/* RAM held by one cached expert: int8 g,u,d (1 byte/elem) + f32 per-row scales.
+ * Must match the allocations in expert_get(). */
+static int64_t expert_cache_bytes(const Cfg *c) {
+    int64_t ng = (int64_t)c->inter * c->hidden, nd = (int64_t)c->hidden * c->inter;
+    return ng + ng + nd + (int64_t)(c->inter + c->inter + c->hidden) * (int64_t)sizeof(float);
+}
+
+/* Residency planner: pick experts/layer to keep in RAM. If ALL experts fit the RAM
+ * budget we keep them all (cap = n_experts) -> the whole small MoE stays resident and
+ * NOTHING streams from disk, which is what makes it fast. Otherwise the largest cap
+ * that fits (the tail still streams via LRU). COLI_RAM_GB overrides the auto budget;
+ * default budget = 65% of physical RAM (leaves headroom for dense weights, KV, OS). */
+static int plan_cap(const Cfg *c) {
+    int64_t bpe = expert_cache_bytes(c);
+    double budget_gb;
+    const char *env = getenv("COLI_RAM_GB");
+    if (env && atof(env) > 0) budget_gb = atof(env);
+    else { uint64_t ph = phys_ram_bytes(); budget_gb = ph ? (double)ph / 1e9 * 0.65 : 24.0; }
+    int64_t per_layer = (int64_t)c->n_layers * bpe;
+    int cap = per_layer > 0 ? (int)((int64_t)(budget_gb * 1e9) / per_layer) : c->n_experts;
+    if (cap > c->n_experts) cap = c->n_experts;
+    if (cap < 1) cap = 1;
+    return cap;
+}
+
+static void expert_get(Model *m, int layer, int eid, Slot **out);  /* fwd: used by prewarm */
+
+/* Pre-load every expert into the resident cache so decode never pays a cold miss.
+ * Only meaningful (and only called) when the plan is fully resident (cap == n_experts). */
+static void prewarm_experts(Model *m) {
+    Cfg *c = &m->c;
+    double t0 = now_s();
+    for (int l = 0; l < c->n_layers; l++)
+        for (int e = 0; e < c->n_experts; e++) { Slot *s; expert_get(m, l, e, &s); }
+    m->hits = m->miss = m->clock = 0;   /* warmup loads are not decode traffic */
+    m->warm_s = now_s() - t0;
+}
+
 static void model_init(Model *m, const char *snap, int cap, int bits) {
     memset(m, 0, sizeof(*m));
     m->quant_bits = bits;
     load_cfg(&m->c, snap);
     st_init(&m->S, snap);
     Cfg *c = &m->c;
+    if (cap <= 0) cap = plan_cap(c);    /* cap<=0 -> auto-plan from RAM budget */
+    m->cap = cap; m->resident = (cap >= c->n_experts);
     double t0 = now_s();
     m->embed      = load_t(m, "model.embed_tokens.weight");
     m->lm_head    = load_t(m, "lm_head.weight");
@@ -212,6 +272,8 @@ static void model_init(Model *m, const char *snap, int cap, int bits) {
     m->cache = calloc(c->n_layers, sizeof(LCache));
     for (int i = 0; i < c->n_layers; i++) { m->cache[i].cap = cap; m->cache[i].slots = calloc(cap, sizeof(Slot)); }
     m->dense_load_s = now_s() - t0;
+    if (m->resident && !(getenv("COLI_NOWARM") && atoi(getenv("COLI_NOWARM"))))
+        prewarm_experts(m);             /* all experts fit -> load them once, decode stays 100% hits */
 }
 
 /* reads a weight from disk (streaming) and quantizes it into q[O,I]+scale[O].
@@ -411,7 +473,7 @@ static int *read_int_array(jval *o, const char *key, int *n_out) {
 int main(int argc, char **argv) {
     const char *snap = getenv("SNAP");
     if (!snap) { fprintf(stderr, "set SNAP=<snapshot directory>\n"); return 1; }
-    int cap  = argc > 1 ? atoi(argv[1]) : 16;
+    int cap  = argc > 1 ? atoi(argv[1]) : 0;   /* 0 (default) -> auto-plan cache size from RAM */
     int bits = argc > 2 ? atoi(argv[2]) : 8;
     if (bits < 2 || bits > 8) {   /* expert storage is int8_t: bits>8 truncates in quantize_rows (#134). f32 mode is not implemented here — int8 is already token-exact vs the oracle. */
         fprintf(stderr, "quant_bits must be 2..8 (got %d); OLMoE experts are int8-backed, no f32 mode\n", bits);
@@ -426,9 +488,18 @@ int main(int argc, char **argv) {
     int np, nfull; int *prompt = read_int_array(ref,"prompt_ids",&np); int *full = read_int_array(ref,"full_ids",&nfull);
     int n_new = nfull - np;
 
-    printf("== Streaming C engine, cache = %d experts/layer, experts @ %d-bit ==\n", cap, bits);
     Model m; model_init(&m, snap, cap, bits);
-    printf("resident weights loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
+    int64_t expert_gb_x10 = m.c.n_experts * (int64_t)m.c.n_layers * expert_cache_bytes(&m.c) / (int64_t)1e8;
+    if (m.resident)
+        printf("== C engine: FULLY RESIDENT — all %d experts/layer in RAM, ZERO disk streaming, experts @ %d-bit ==\n",
+               m.c.n_experts, bits);
+    else
+        printf("== C engine: STREAMING — cache %d/%d experts/layer (model %.1f GB > RAM budget), experts @ %d-bit ==\n",
+               m.cap, m.c.n_experts, expert_gb_x10 / 10.0, bits);
+    printf("dense loaded in %.1fs | RSS after load: %.2f GB\n", m.dense_load_s, rss_gb());
+    if (m.resident && m.warm_s > 0)
+        printf("prewarmed %d experts in %.1fs (decode will be 100%% cache hits)\n",
+               m.c.n_experts * m.c.n_layers, m.warm_s);
 
     int *out = malloc((np + n_new) * sizeof(int));
     double t = now_s();
